@@ -646,6 +646,35 @@
     .reaction-details-empty { color:#999; font-size:12px; text-align:center; padding:12px 2px; }
     @media (max-width:760px) { .typing-indicator { padding:6px 11px 0; font-size:10px; } .reaction-picker { max-width:calc(100vw - 16px); } }
 
+  
+    /* Quick jump to latest message. */
+    .chat-panel { position: relative; }
+    .scroll-latest-button {
+      position: absolute; z-index: 16; right: 18px; bottom: 76px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 7px;
+      min-height: 38px; padding: 0 12px; border: 1px solid rgba(255,255,255,.20);
+      border-radius: 999px; color: #f5f5f5; background: rgba(35,35,35,.97);
+      box-shadow: 0 8px 25px rgba(0,0,0,.45), 0 0 18px rgba(255,255,255,.04);
+      font-size: 10px; font-weight: 750; cursor: pointer; backdrop-filter: blur(12px);
+      transition: opacity .16s, transform .16s, background .16s;
+    }
+    .scroll-latest-button:hover { background: #303030; transform: translateY(-2px); }
+    .scroll-latest-button svg { width: 15px; height: 15px; flex: 0 0 auto; }
+    @media (max-width:760px) { .scroll-latest-button { right: 12px; bottom: 72px; min-height: 36px; } }
+
+    /* Notifications can be dismissed by the close button or a horizontal swipe. */
+    .toast { display: flex; align-items: flex-start; gap: 10px; padding-right: 11px; pointer-events: auto; touch-action: pan-y; user-select: none; will-change: transform, opacity; }
+    .toast-message { flex: 1; min-width: 0; }
+    .toast-dismiss {
+      display: grid; place-items: center; flex: 0 0 25px; width: 25px; height: 25px;
+      margin: -4px -4px 0 0; padding: 0; border: 0; border-radius: 7px;
+      color: #aaa; background: transparent; font-size: 20px; font-weight: 400;
+      line-height: 1; cursor: pointer;
+    }
+    .toast-dismiss:hover, .toast-dismiss:focus-visible { color: #fff; background: rgba(255,255,255,.10); }
+    .toast.is-dismissing { pointer-events: none; transition: transform .18s ease, opacity .18s ease; }
+    @media (max-width:760px) { .toast-region { right: 10px; width: calc(100% - 20px); } }
+
   </style>
 </head>
 <body>
@@ -722,6 +751,10 @@
           <div id="messages" class="messages" aria-live="polite" aria-label="Lịch sử tin nhắn">
             <div class="empty-chat" id="empty-chat"><div class="empty-chat-icon"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"><path d="M20 11.5a7.5 7.5 0 0 1-7.5 7.5H5l-2 2v-9.5A7.5 7.5 0 0 1 10.5 4H12a8 8 0 0 1 8 7.5Z"/><path d="M8 11h8m-8 3h5"/></svg></div><strong>Chưa có tin nhắn</strong></div>
           </div>
+          <button id="scroll-latest-button" class="scroll-latest-button hidden" type="button" aria-label="Cuộn đến tin nhắn mới nhất" title="Cuộn đến tin nhắn mới nhất">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 4v16M5 13l7 7 7-7"/></svg>
+            <span>Tin mới nhất</span>
+          </button>
           <div id="typing-indicator" class="typing-indicator hidden" aria-live="polite"></div>
           <div class="composer-area">
             <div id="reply-preview" class="reply-preview hidden">
@@ -818,6 +851,7 @@
     let wakeLockEnabled = loadWakeLockPreference();
     let micMode = loadMicMode();
     let pttActive = false;
+    let pttKeyActive = false;
     let micPointerState = null;
     let suppressMicClick = false;
     let memberVolumeLevels = loadMemberVolumeLevels();
@@ -910,12 +944,66 @@
       paintAvatar($('profile-preview-avatar'), name, pendingAvatar || profile.avatar);
     }
 
+    function dismissToast(toast, direction = 1) {
+      if (!toast || toast.classList.contains('is-dismissing')) return;
+      if (toast._dismissTimer) window.clearTimeout(toast._dismissTimer);
+      toast.classList.add('is-dismissing');
+      toast.style.transform = `translateX(${direction * Math.max(window.innerWidth, toast.offsetWidth)}px)`;
+      toast.style.opacity = '0';
+      window.setTimeout(() => toast.remove(), 210);
+    }
+
     function showToast(message, type = '') {
       const toast = document.createElement('div');
       toast.className = `toast ${type}`.trim();
-      toast.textContent = message;
+      const text = document.createElement('span');
+      text.className = 'toast-message';
+      text.textContent = String(message ?? '');
+      const dismiss = document.createElement('button');
+      dismiss.type = 'button';
+      dismiss.className = 'toast-dismiss';
+      dismiss.setAttribute('aria-label', 'Đóng thông báo');
+      dismiss.title = 'Đóng thông báo';
+      dismiss.textContent = '×';
+      dismiss.addEventListener('click', (event) => {
+        event.stopPropagation();
+        dismissToast(toast, 1);
+      });
+      toast.append(text, dismiss);
+
+      let swipe = null;
+      toast.addEventListener('pointerdown', (event) => {
+        if (event.target.closest('.toast-dismiss') || event.button === 2) return;
+        swipe = { id: event.pointerId, x: event.clientX, y: event.clientY, dx: 0, dy: 0 };
+        try { toast.setPointerCapture(event.pointerId); } catch (_) {}
+      });
+      toast.addEventListener('pointermove', (event) => {
+        if (!swipe || swipe.id !== event.pointerId) return;
+        swipe.dx = event.clientX - swipe.x;
+        swipe.dy = event.clientY - swipe.y;
+        if (Math.abs(swipe.dx) > Math.abs(swipe.dy) && Math.abs(swipe.dx) > 8) {
+          toast.style.transform = `translateX(${swipe.dx}px)`;
+          toast.style.opacity = String(Math.max(.35, 1 - Math.abs(swipe.dx) / 190));
+        }
+      });
+      const finishSwipe = (event) => {
+        if (!swipe || (event && swipe.id !== event.pointerId)) return;
+        const state = swipe;
+        swipe = null;
+        if (Math.abs(state.dx) > 64 && Math.abs(state.dx) > Math.abs(state.dy) * 1.15) {
+          dismissToast(toast, state.dx < 0 ? -1 : 1);
+        } else if (!toast.classList.contains('is-dismissing')) {
+          toast.style.transform = '';
+          toast.style.opacity = '';
+        }
+      };
+      toast.addEventListener('pointerup', finishSwipe);
+      toast.addEventListener('pointercancel', finishSwipe);
+
       $('toast-region').appendChild(toast);
-      window.setTimeout(() => toast.remove(), 4300);
+      toast._dismissTimer = window.setTimeout(() => {
+        if (toast.isConnected && !toast.classList.contains('is-dismissing')) toast.remove();
+      }, 4300);
     }
 
     function loadWakeLockPreference() {
@@ -1822,6 +1910,7 @@
       }
       if (isLive && message.senderId !== myPeerId && message.mentions.includes(myPeerId)) playRoomSound('ping');
       renderMessagePinnedState();
+      updateScrollLatestButton();
     }
 
     function markUnreadMessage(messageId) {
@@ -1829,7 +1918,28 @@
       const row = document.querySelector(`.message-row[data-message-id="${CSS.escape(String(messageId))}"]`);
       if (row) row.classList.add('is-unread');
       updateUnreadNotice();
+      updateScrollLatestButton();
     }
+    function updateScrollLatestButton() {
+      const viewport = $('messages');
+      const button = $('scroll-latest-button');
+      if (!viewport || !button) return;
+      const distance = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight;
+      const atBottom = distance < 72;
+      button.classList.toggle('hidden', atBottom || $('room-screen').classList.contains('hidden'));
+    }
+    $('messages').addEventListener('scroll', () => {
+      updateScrollLatestButton();
+      const viewport = $('messages');
+      const atBottom = viewport.scrollHeight - viewport.scrollTop - viewport.clientHeight < 72;
+      if (atBottom && document.visibilityState === 'visible' && unreadMessageIds.length) clearUnreadMessages();
+    }, { passive: true });
+    $('scroll-latest-button').addEventListener('click', () => {
+      const viewport = $('messages');
+      viewport.scrollTo({ top: viewport.scrollHeight, behavior: 'smooth' });
+      clearUnreadMessages();
+      window.setTimeout(updateScrollLatestButton, 300);
+    });
     function updateUnreadNotice() {
       const count = unreadMessageIds.length;
       document.title = count ? `(${count}) tin nhắn mới · ${originalDocumentTitle}` : originalDocumentTitle;
@@ -1983,14 +2093,21 @@
       try { return localStorage.getItem('namelessRoom.micMode') === 'ptt' ? 'ptt' : 'toggle'; }
       catch (_) { return 'toggle'; }
     }
+    function supportsPTTKeyboard() {
+      return !!(window.matchMedia && window.matchMedia('(hover: hover) and (pointer: fine)').matches);
+    }
     function setMicMode(mode) {
       micMode = mode === 'ptt' ? 'ptt' : 'toggle';
       micMuted = false;
       pttActive = false;
+      pttKeyActive = false;
       try { localStorage.setItem('namelessRoom.micMode', micMode); } catch (_) {}
       closeMicModeMenu();
       updateMicButton();
-      showToast(micMode === 'ptt' ? 'Push to talk: giữ mic để nói, thả để tắt.' : 'Đã chuyển sang chế độ bật/tắt mic.');
+      const hint = micMode === 'ptt'
+        ? (supportsPTTKeyboard() ? 'Push to talk: giữ mic hoặc nhấn giữ phím T để nói; thả ra để tắt.' : 'Push to talk: giữ mic để nói, thả ra để tắt.')
+        : 'Đã chuyển sang chế độ bật/tắt mic.';
+      showToast(hint);
     }
     function updateMicButton() {
       const self = usersData[myPeerId] || {};
@@ -2060,15 +2177,16 @@
     function finishMicPointer(event) {
       const state = micPointerState;
       if (!state || (event && state.id !== event.pointerId)) return;
+      micPointerState = null;
       if (micMode === 'ptt' && !state.menuShown) {
-        pttActive = false; updateMicButton();
-        if (usersData[myPeerId]) updateSpeakingStatus(myPeerId, false, true);
+        pttActive = pttKeyActive;
+        updateMicButton();
+        if (!pttActive && usersData[myPeerId]) updateSpeakingStatus(myPeerId, false, true);
       }
       if (state.menuShown) {
         suppressMicClick = true;
         window.setTimeout(() => { suppressMicClick = false; }, 0);
       }
-      micPointerState = null;
     }
     $('mic-toggle').addEventListener('pointerup', finishMicPointer);
     $('mic-toggle').addEventListener('pointercancel', finishMicPointer);
@@ -2077,6 +2195,33 @@
       if (!event.target.closest('#mic-mode-menu') && !event.target.closest('#mic-toggle')) closeMicModeMenu();
     });
     document.addEventListener('keydown', (event) => { if (event.key === 'Escape') closeMicModeMenu(); });
+    function isPTTTextEntryTarget(target) {
+      return !!(target && (target.isContentEditable || target.closest('input, textarea, select, [contenteditable="true"], [role="textbox"]')));
+    }
+    document.addEventListener('keydown', (event) => {
+      if (event.key.toLowerCase() !== 't' || event.repeat || event.isComposing || event.altKey || event.ctrlKey || event.metaKey || event.shiftKey) return;
+      if (!supportsPTTKeyboard() || micMode !== 'ptt' || $('room-screen').classList.contains('hidden') || isPTTTextEntryTarget(document.activeElement)) return;
+      if (!localStream || (usersData[myPeerId] && usersData[myPeerId].mutedByHost)) return;
+      event.preventDefault();
+      pttKeyActive = true;
+      pttActive = true;
+      updateMicButton();
+    });
+    document.addEventListener('keyup', (event) => {
+      if (event.key.toLowerCase() !== 't' || !pttKeyActive) return;
+      pttKeyActive = false;
+      pttActive = !!(micPointerState && !micPointerState.menuShown);
+      updateMicButton();
+      if (!pttActive && usersData[myPeerId]) updateSpeakingStatus(myPeerId, false, true);
+    });
+    window.addEventListener('blur', () => {
+      pttKeyActive = false;
+      if (micMode === 'ptt') {
+        pttActive = false;
+        updateMicButton();
+        if (usersData[myPeerId]) updateSpeakingStatus(myPeerId, false, true);
+      }
+    });
     window.addEventListener('resize', closeMicModeMenu);
 
     $('leave-button').addEventListener('click', async () => {
@@ -2225,7 +2370,8 @@
       setConnectionStatus('Đã rời phòng', 'offline');
       roomPasswordHash = ''; roomPasswordPlain = ''; hostId = ''; roomId = ''; myPeerId = ''; myUsername = effectiveName(); myAvatar = profile.avatar;
       composerMentionTargets.clear(); $('mention-suggestions').classList.add('hidden'); $('search-bar').classList.add('hidden'); $('search-input').value=''; clearSearchHighlights();
-      isHost = false; authAccepted = false; micMuted = false; hostAttemptHandled = false; joining = false;
+      isHost = false; authAccepted = false; micMuted = false; pttActive = false; pttKeyActive = false; micPointerState = null; hostAttemptHandled = false; joining = false;
+      $('scroll-latest-button').classList.add('hidden');
       $('join-button').disabled = false; $('join-button').querySelector('span').textContent = 'Vào phòng';
       leaving = false;
       if (!silent) showToast('Bạn đã rời phòng thoại.', 'success');
