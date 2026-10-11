@@ -771,7 +771,7 @@
   <div id="reaction-picker" class="reaction-picker hidden" role="group" aria-label="Chọn biểu cảm"></div>
   <div id="reaction-details-modal" class="modal-backdrop hidden" role="presentation">
     <section class="modal-card reaction-details-card" role="dialog" aria-modal="true" aria-labelledby="reaction-details-title">
-      <div class="modal-head"><div><h2 id="reaction-details-title">Biểu cảm tin nhắn</h2><p id="reaction-details-subtitle">Ai đã chọn biểu cảm nào</p></div><button id="close-reaction-details" class="icon-button" type="button" aria-label="Đóng"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
+      <div class="modal-head"><div><h2 id="reaction-details-title">Biểu cảm tin nhắn</h2></div><button id="close-reaction-details" class="icon-button" type="button" aria-label="Đóng"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="m6 6 12 12M18 6 6 18"/></svg></button></div>
       <div id="reaction-details-content" class="reaction-details-content"></div>
     </section>
   </div>
@@ -2665,8 +2665,6 @@
         groups.get(item.emoji).push({ id, name: item.name || (usersData[id] && usersData[id].name) || 'Thành viên' });
       });
       content.replaceChildren();
-      const total = Object.keys(message.reactions || {}).length;
-      $('reaction-details-subtitle').textContent = total ? `${total} lượt biểu cảm · mỗi người chỉ chọn một biểu cảm` : 'Chưa có ai thả biểu cảm';
       REACTION_EMOJIS.forEach(emoji => {
         const people = groups.get(emoji);
         if (!people || !people.length) return;
