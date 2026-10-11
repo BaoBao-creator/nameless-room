@@ -641,6 +641,7 @@
     .attachment-media { display:block; max-width:100%; max-height:360px; background:#050505; }
     .attachment-media img { display:block; max-width:100%; max-height:360px; width:auto; height:auto; object-fit:contain; cursor:zoom-in; }
     .attachment-media video { display:block; max-width:100%; max-height:360px; }
+    .attachment-media audio { display:block; width:100%; max-width:100%; margin:8px 0; }
     .attachment-card-footer { display:flex; align-items:center; gap:10px; padding:9px 10px; }
     .attachment-file-icon { display:grid; place-items:center; width:31px; height:31px; flex:0 0 31px; border:1px solid rgba(255,255,255,.12); border-radius:8px; color:#ddd; font-size:9px; font-weight:800; }
     .attachment-copy { flex:1; min-width:0; }
@@ -823,7 +824,7 @@
   </div>
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" onerror="this.onerror=null;const fallback=document.createElement('script');fallback.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(fallback);"></script>
+  <script async src="https://cdn.jsdelivr.net/npm/mp4box@2.3.0/dist/mp4box.all.min.js"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     'use strict';
@@ -845,6 +846,18 @@
     let peer = null;
     let hostPeer = null;
     let hostConnection = null;
+    let roomSignalChannel = null;
+    let roomSignalTopic = '';
+    let roomSignalAuth = '';
+    let roomSignalState = 'CLOSED';
+    let pendingRealtimeSignals = [];
+    const VIDEO_CHUNK_BYTES = 1024 * 1024;
+    const VIDEO_KEEP_BACK_SECONDS = 30;
+    const VIDEO_BUFFER_AHEAD_SECONDS = 45;
+    const VIDEO_PREBUFFER_CHUNKS = 3;
+    const activeVideoStreams = new Map();
+    const activeVideoControllers = new Map();
+    const activeVideoObjectUrls = new Map();
     let hostId = '';
     let roomId = '';
     let roomPasswordHash = '';
@@ -896,16 +909,6 @@
     let authAccepted = false;
     let hostAttemptHandled = false;
     let hostAttemptTimer = null;
-    let clientPeerOpenTimer = null;
-    let hostDataReconnectTimer = null;
-    let hostDataReconnectAttempts = 0;
-    let hostDataConnecting = false;
-    let hostDataReconnectNoticeShown = false;
-    const audioReconnectTimers = Object.create(null);
-    const audioReconnectAttempts = Object.create(null);
-    const peerRecoveryStates = new WeakMap();
-    const PEER_OPEN_TIMEOUT_MS = 15000;
-    const MEDIA_CALL_TIMEOUT_MS = 20000;
     let pendingAvatar = '';
     let replyTarget = null;
     let selectedContextMessage = null;
@@ -921,6 +924,269 @@
     const REACTION_EMOJIS = ['👍', '❤️', '😂', '😮', '😢', '🔥', '🎉', '🙏'];
     let reactionDetailsMessageId = null;
     let reactionPickerMessageId = null;
+
+    function emitRoomSignal(payload) {
+      const instance = peer && !peer.destroyed ? peer : hostPeer && !hostPeer.destroyed ? hostPeer : null;
+      if (instance) instance._receiveSignal(payload);
+      else if (pendingRealtimeSignals.length < 200) pendingRealtimeSignals.push(payload);
+    }
+    async function setupRoomSignaling() {
+      if (!supabaseClient) throw new Error('Không tải được Supabase Realtime.');
+      if (roomSignalChannel) { try { await supabaseClient.removeChannel(roomSignalChannel); } catch (_) {} roomSignalChannel = null; }
+      const secret = await hashString(`nameless-room:signal:v2:${supabaseRoomId}:${roomPasswordHash}`);
+      roomSignalTopic = `nameless-room-${secret.slice(0, 48)}`;
+      roomSignalAuth = await hashString(`nameless-room:signal-auth:v2:${supabaseRoomId}:${roomPasswordHash}`);
+      pendingRealtimeSignals = [];
+      roomSignalState = 'CONNECTING';
+      roomSignalChannel = supabaseClient.channel(roomSignalTopic, { config: { broadcast: { self: false, ack: true } } });
+      roomSignalChannel.on('broadcast', { event: 'signal' }, ({ payload }) => {
+        if (!payload || payload.auth !== roomSignalAuth || !payload.from || !payload.to) return;
+        emitRoomSignal(payload);
+      });
+      await new Promise((resolve, reject) => {
+        let settled = false;
+        const timer = setTimeout(() => {
+          if (settled) return;
+          settled = true; reject(new Error('Supabase Realtime không kết nối được trong 12 giây. Kiểm tra Realtime và mạng của thiết bị.'));
+        }, 12000);
+        roomSignalChannel.subscribe((status, error) => {
+          roomSignalState = status;
+          if (status === 'SUBSCRIBED' && !settled) { settled = true; clearTimeout(timer); resolve(); }
+          else if (['CHANNEL_ERROR', 'TIMED_OUT', 'CLOSED'].includes(status)) {
+            console.warn('Supabase Realtime channel status:', status, error || '');
+            const active = peer && !peer.destroyed ? peer : hostPeer && !hostPeer.destroyed ? hostPeer : null;
+            if (active) { const e = new Error(`Supabase Realtime: ${status}`); e.type = 'network'; active.emit('error', e); }
+            if (!settled) { settled = true; clearTimeout(timer); reject(new Error(`Không thể kết nối kênh Supabase Realtime (${status}).`)); }
+          }
+        });
+      });
+    }
+    async function closeRoomSignaling() {
+      const channel = roomSignalChannel;
+      roomSignalChannel = null; roomSignalTopic = ''; roomSignalAuth = ''; roomSignalState = 'CLOSED'; pendingRealtimeSignals = [];
+      if (channel && supabaseClient) { try { await supabaseClient.removeChannel(channel); } catch (error) { console.debug('Could not remove Realtime channel:', error); } }
+    }
+
+    class Peer {
+      constructor(idOrOptions, options = {}) {
+        this.id = typeof idOrOptions === 'string' ? idOrOptions : makeId();
+        this.handlers = Object.create(null);
+        this._sessions = new Map();
+        this._pendingSignals = new Map();
+        this.destroyed = false;
+        this.open = false;
+        window.setTimeout(() => {
+          if (this.destroyed) return;
+          this.open = true;
+          this.emit('open', this.id);
+          const queued = pendingRealtimeSignals.splice(0);
+          queued.forEach(signal => this._receiveSignal(signal));
+        }, 0);
+      }
+      on(event, handler) { (this.handlers[event] ||= []).push(handler); return this; }
+      emit(event, value) { (this.handlers[event] || []).slice().forEach(handler => { try { handler(value); } catch (error) { console.error(`RealtimePeer ${event} handler failed:`, error); } }); }
+      async _sendSignal(to, type, session, extra = {}) {
+        if (!roomSignalChannel || roomSignalState !== 'SUBSCRIBED') throw new Error('Supabase Realtime chưa sẵn sàng.');
+        const payload = { auth: roomSignalAuth, from: this.id, to, type, kind: session ? session.kind : extra.kind, sessionId: session ? session.sessionId : extra.sessionId, metadata: session ? session.metadata : (extra.metadata || {}), ...extra };
+        const result = await roomSignalChannel.send({ type: 'broadcast', event: 'signal', payload });
+        if (result && result.status && result.status !== 'ok') throw new Error(`Không gửi được tín hiệu Supabase (${result.status}).`);
+      }
+      connect(remoteId, options = {}) {
+        const session = new RtcPeerSession(this, remoteId, 'data', options.metadata || {}, true);
+        this._sessions.set(session.sessionId, session);
+        session._startOutgoing(null).catch(error => session._fail(error));
+        return session;
+      }
+      call(remoteId, stream, options = {}) {
+        const session = new RtcPeerSession(this, remoteId, 'call', options.metadata || {}, true);
+        this._sessions.set(session.sessionId, session);
+        session._startOutgoing(stream).catch(error => session._fail(error));
+        return session;
+      }
+      _receiveSignal(packet) {
+        if (this.destroyed || !packet || packet.to !== this.id || packet.from === this.id) return;
+        if (packet.type === 'offer') {
+          const existing = this._sessions.get(packet.sessionId);
+          if (existing) {
+            // Re-send an answer when the first Broadcast ACK/packet was lost.
+            if (existing._incoming && existing.pc.localDescription && existing.pc.localDescription.type === 'answer') existing._sendDescription('answer').catch(() => {});
+            return;
+          }
+          const session = new RtcPeerSession(this, packet.from, packet.kind, packet.metadata || {}, false, packet.sessionId);
+          this._sessions.set(session.sessionId, session);
+          const pending = this._pendingSignals.get(packet.sessionId) || [];
+          this._pendingSignals.delete(packet.sessionId);
+          pending.forEach(signal => { if (signal.type === 'ice' && signal.candidate) session._acceptCandidate(signal.candidate).catch(() => {}); });
+          if (session.kind === 'data') this.emit('connection', session);
+          session._acceptOffer(packet).catch(error => session._fail(error));
+          return;
+        }
+        const session = this._sessions.get(packet.sessionId);
+        if (!session) {
+          if (packet.type === 'ice' && packet.candidate) {
+            const list = this._pendingSignals.get(packet.sessionId) || [];
+            if (list.length < 64) list.push(packet);
+            this._pendingSignals.set(packet.sessionId, list);
+          }
+          return;
+        }
+        if (packet.type === 'answer') session._acceptAnswer(packet.description).catch(error => session._fail(error));
+        else if (packet.type === 'ice' && packet.candidate) session._acceptCandidate(packet.candidate).catch(error => console.debug('ICE candidate rejected:', error));
+        else if (packet.type === 'bye') session._close(false);
+      }
+      destroy() {
+        if (this.destroyed) return;
+        this.destroyed = true; this.open = false;
+        [...this._sessions.values()].forEach(session => session._close(true));
+        this._sessions.clear(); this.emit('close');
+      }
+    }
+
+    class RtcPeerSession {
+      constructor(owner, remoteId, kind, metadata, outgoing, sessionId = makeId()) {
+        this.owner = owner; this.peer = String(remoteId); this.kind = kind === 'call' ? 'call' : 'data';
+        this.metadata = metadata || {}; this.sessionId = sessionId; this._incoming = !outgoing;
+        this.handlers = Object.create(null); this.open = false; this.destroyed = false;
+        this.channel = null; this._descriptionSent = false; this._gotAnswer = false;
+        this._pendingLocalCandidates = []; this._pendingRemoteCandidates = [];
+        this._messageChunks = new Map();
+        this.pc = new RTCPeerConnection({ iceServers: [
+          { urls: 'stun:stun.l.google.com:19302' },
+          { urls: 'stun:stun.cloudflare.com:3478' }
+        ] });
+        this.pc.onicecandidate = event => {
+          if (!event.candidate || this.destroyed) return;
+          const candidate = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+          if (!this._descriptionSent) this._pendingLocalCandidates.push(candidate);
+          else this.owner._sendSignal(this.peer, 'ice', this, { candidate }).catch(error => console.debug('Could not signal ICE candidate:', error));
+        };
+        this.pc.ontrack = event => {
+          let stream = event.streams && event.streams[0];
+          if (!stream) {
+            if (!this._remoteStream) this._remoteStream = new MediaStream();
+            stream = this._remoteStream;
+            if (!stream.getTracks().some(track => track.id === event.track.id)) stream.addTrack(event.track);
+          }
+          this.emit('stream', stream);
+        };
+        const stateChanged = () => {
+          const state = this.pc.connectionState || this.pc.iceConnectionState;
+          if (state === 'connected' || state === 'completed') { if (this.kind === 'call') this.open = true; else this.open = !!(this.channel && this.channel.readyState === 'open'); }
+          if (state === 'failed') { const error = new Error('WebRTC không tìm được đường truyền. Mạng này có thể cần TURN.'); error.type = 'network'; this.emit('error', error); }
+          if (state === 'closed' && !this.destroyed) this._close(false);
+        };
+        this.pc.onconnectionstatechange = stateChanged;
+        this.pc.oniceconnectionstatechange = stateChanged;
+        this.pc.ondatachannel = event => this._attachDataChannel(event.channel);
+      }
+      on(event, handler) { (this.handlers[event] ||= []).push(handler); return this; }
+      emit(event, value) { (this.handlers[event] || []).slice().forEach(handler => { try { handler(value); } catch (error) { console.error(`RTC session ${event} handler failed:`, error); } }); }
+      _attachDataChannel(channel) {
+        this.channel = channel; channel.binaryType = 'arraybuffer';
+        channel.onopen = () => { if (this.destroyed) return; this.open = true; this.emit('open'); };
+        channel.onmessage = event => {
+          let data = event.data;
+          if (typeof data === 'string') { try { data = JSON.parse(data); } catch (_) { this.emit('data', data); return; } }
+          if (data && data.__nrDataChunk === 1 && typeof data.id === 'string' && Number.isInteger(data.index) && Number.isInteger(data.total) && data.total > 0 && data.total <= 512 && typeof data.part === 'string') {
+            let entry = this._messageChunks.get(data.id);
+            if (!entry) {
+              entry = { parts: new Array(data.total), received: 0, bytes: 0, timer: setTimeout(() => this._messageChunks.delete(data.id), 30000) };
+              this._messageChunks.set(data.id, entry);
+            }
+            if (entry.parts.length !== data.total || data.index < 0 || data.index >= data.total) return;
+            if (entry.parts[data.index] === undefined) { entry.parts[data.index] = data.part; entry.received++; entry.bytes += data.part.length; }
+            if (entry.bytes > 6 * 1024 * 1024) { clearTimeout(entry.timer); this._messageChunks.delete(data.id); return; }
+            if (entry.received === data.total) {
+              clearTimeout(entry.timer); this._messageChunks.delete(data.id);
+              try { this.emit('data', JSON.parse(entry.parts.join(''))); } catch (error) { console.warn('Could not rebuild a chunked RTC data message:', error); }
+            }
+            return;
+          }
+          this.emit('data', data);
+        };
+        channel.onerror = event => this.emit('error', event.error || new Error('RTCDataChannel gặp lỗi.'));
+        channel.onclose = () => { if (!this.destroyed) this._close(false); };
+      }
+      send(data) {
+        if (!this.channel || this.channel.readyState !== 'open') throw new Error('Kênh dữ liệu chưa mở.');
+        if (this.channel.bufferedAmount > 2 * 1024 * 1024) throw new Error('Kênh dữ liệu đang quá tải; hãy gửi lại sau ít giây.');
+        const text = JSON.stringify(data);
+        const partSize = 12000;
+        if (text.length > 512 * partSize) throw new Error('Tin nhắn điều khiển quá lớn.');
+        const total = Math.max(1, Math.ceil(text.length / partSize));
+        const id = makeId();
+        for (let index = 0; index < total; index++) {
+          this.channel.send(JSON.stringify({ __nrDataChunk: 1, id, index, total, part: text.slice(index * partSize, (index + 1) * partSize) }));
+        }
+      }
+      async _startOutgoing(stream) {
+        if (this.destroyed) return;
+        if (this.kind === 'data') this._attachDataChannel(this.pc.createDataChannel('nameless-room-data', { ordered: true }));
+        else if (stream) stream.getTracks().forEach(track => this.pc.addTrack(track, stream));
+        const offer = await this.pc.createOffer();
+        await this.pc.setLocalDescription(offer);
+        await this._sendDescription('offer');
+        let attempts = 0;
+        this._offerRetryTimer = window.setInterval(() => {
+          if (this.destroyed || this._gotAnswer || attempts >= 4) { clearInterval(this._offerRetryTimer); return; }
+          attempts++;
+          this._sendDescription('offer').catch(error => console.debug('Offer retry failed:', error));
+        }, 2200);
+      }
+      async _sendDescription(type) {
+        if (!this.pc.localDescription || this.destroyed) return;
+        await this.owner._sendSignal(this.peer, type, this, { description: { type: this.pc.localDescription.type, sdp: this.pc.localDescription.sdp } });
+        this._descriptionSent = true;
+        const pending = this._pendingLocalCandidates.splice(0);
+        for (const candidate of pending) await this.owner._sendSignal(this.peer, 'ice', this, { candidate });
+      }
+      async _acceptOffer(packet) {
+        this.metadata = packet.metadata || this.metadata;
+        await this.pc.setRemoteDescription(new RTCSessionDescription(packet.description));
+        this._remoteDescriptionReady = true;
+        for (const candidate of this._pendingRemoteCandidates.splice(0)) await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+        if (this.kind === 'data') {
+          const answer = await this.pc.createAnswer();
+          await this.pc.setLocalDescription(answer);
+          await this._sendDescription('answer');
+        } else {
+          this.emit('call', this);
+        }
+      }
+      async answer(stream) {
+        if (this.kind !== 'call' || this._answered || this.destroyed) return;
+        this._answered = true;
+        if (stream) stream.getTracks().forEach(track => this.pc.addTrack(track, stream));
+        const answer = await this.pc.createAnswer();
+        await this.pc.setLocalDescription(answer);
+        await this._sendDescription('answer');
+      }
+      async _acceptAnswer(description) {
+        if (this.destroyed || !description) return;
+        await this.pc.setRemoteDescription(new RTCSessionDescription(description));
+        this._gotAnswer = true;
+        if (this._offerRetryTimer) clearInterval(this._offerRetryTimer);
+        for (const candidate of this._pendingRemoteCandidates.splice(0)) await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+      async _acceptCandidate(candidate) {
+        if (this.destroyed) return;
+        if (!this.pc.remoteDescription) this._pendingRemoteCandidates.push(candidate);
+        else await this.pc.addIceCandidate(new RTCIceCandidate(candidate));
+      }
+      _fail(error) { if (this.destroyed) return; console.warn('WebRTC session error:', this.peer, error); this.emit('error', error instanceof Error ? error : new Error(String(error))); }
+      _close(notifyRemote = true) {
+        if (this.destroyed) return;
+        this.destroyed = true; this.open = false;
+        if (this._offerRetryTimer) clearInterval(this._offerRetryTimer);
+        if (notifyRemote) this.owner._sendSignal(this.peer, 'bye', this).catch(() => {});
+        try { if (this.channel && this.channel.readyState !== 'closed') this.channel.close(); } catch (_) {}
+        try { if (this.pc.signalingState !== 'closed') this.pc.close(); } catch (_) {}
+        this.owner._sessions.delete(this.sessionId);
+        this._messageChunks.forEach(entry => clearTimeout(entry.timer)); this._messageChunks.clear();
+        this.emit('close');
+      }
+      close() { this._close(true); }
+    }
 
     async function callRoomApi(action, payload = {}, options = {}) {
       if (!SUPABASE_PUBLISHABLE_KEY || !ROOM_API_URL) throw new Error('Chưa cấu hình Supabase.');
@@ -941,78 +1207,6 @@
         if (!response.ok || result.error || result.ok === false) throw new Error(result.error || `Supabase trả về lỗi HTTP ${response.status}.`);
         return result;
       } finally { window.clearTimeout(timeout); }
-    }
-
-    // PeerJS dùng máy chủ signaling riêng; Supabase ở đây chỉ quản lý phòng/heartbeat/file.
-    // Thêm STUN dự phòng và tự nối lại socket signaling khi mạng chập chờn.
-    function makePeerOptions() {
-      return {
-        debug: 1,
-        config: {
-          sdpSemantics: 'unified-plan',
-          iceServers: [
-            { urls: 'stun:stun.l.google.com:19302' },
-            { urls: 'stun:stun1.l.google.com:19302' },
-            { urls: 'stun:global.stun.twilio.com:3478' }
-          ]
-        }
-      };
-    }
-
-    function peerErrorText(error) {
-      const type = error && error.type ? String(error.type) : 'unknown';
-      const details = {
-        'browser-incompatible': 'Trình duyệt không hỗ trợ WebRTC. Hãy thử Chrome, Edge hoặc Firefox bản mới.',
-        'invalid-id': 'ID PeerJS không hợp lệ.',
-        'unavailable-id': 'ID PeerJS đang được một kết nối khác sử dụng.',
-        'peer-unavailable': 'Không tìm thấy đầu bên kia trên máy chủ tín hiệu PeerJS. Chủ phòng có thể đang ngoại tuyến.',
-        network: 'Không thể kết nối tới máy chủ tín hiệu PeerJS; hãy kiểm tra mạng, VPN hoặc tường lửa.',
-        'server-error': 'Máy chủ tín hiệu PeerJS trả về lỗi.',
-        'socket-error': 'Socket tín hiệu PeerJS gặp lỗi.',
-        'socket-closed': 'Socket tín hiệu PeerJS bị đóng đột ngột.',
-        'ssl-unavailable': 'Máy chủ PeerJS không hỗ trợ kết nối HTTPS cần thiết.',
-        webrtc: 'WebRTC không thiết lập được kết nối trực tiếp giữa hai thiết bị.'
-      };
-      return `${details[type] || 'PeerJS gặp lỗi kết nối.'} (mã lỗi: ${type}).`;
-    }
-
-    function attachPeerSignalingRecovery(peerInstance, label) {
-      const state = { timer: null, attempts: 0 };
-      peerRecoveryStates.set(peerInstance, state);
-      const clearRetry = () => {
-        if (state.timer) clearTimeout(state.timer);
-        state.timer = null;
-      };
-      const scheduleRetry = () => {
-        if (state.timer || leaving || peerInstance.destroyed) return;
-        const delay = Math.min(8000, 750 * (2 ** state.attempts));
-        state.timer = window.setTimeout(() => {
-          state.timer = null;
-          if (leaving || peerInstance.destroyed) return;
-          if (!peerInstance.disconnected) return;
-          state.attempts += 1;
-          try { peerInstance.reconnect(); }
-          catch (error) { console.warn(`PeerJS signaling reconnect failed (${label}):`, error); }
-          if (state.attempts < 6) scheduleRetry();
-          else showToast('Kết nối tín hiệu PeerJS vẫn chưa ổn định. Hãy kiểm tra mạng hoặc thử vào lại phòng.', 'error');
-        }, delay);
-      };
-      peerInstance.on('open', () => {
-        clearRetry();
-        state.attempts = 0;
-      });
-      peerInstance.on('disconnected', () => {
-        if (leaving) return;
-        console.warn(`PeerJS signaling disconnected (${label}).`);
-        setConnectionStatus('Đang khôi phục tín hiệu', 'waiting');
-        scheduleRetry();
-      });
-      peerInstance.on('error', (error) => {
-        console.warn(`PeerJS signaling error (${label}):`, error);
-        if (error && ['network', 'server-error', 'socket-error', 'socket-closed'].includes(error.type) && peerInstance.disconnected) {
-          scheduleRetry();
-        }
-      });
     }
 
     function startRoomHeartbeat() {
@@ -1084,22 +1278,43 @@
         const encryptedSizeBytes = Number(raw.encryptedSizeBytes ?? raw.encrypted_size_bytes);
         const encryptionIv = String(raw.encryptionIv || raw.encryption_iv || '').slice(0, 200);
         if (!id || !encryptionIv || !Number.isSafeInteger(sizeBytes) || sizeBytes < 0 || !Number.isSafeInteger(encryptedSizeBytes) || encryptedSizeBytes < 1) return null;
-        return { id, name, mimeType, sizeBytes, encryptedSizeBytes, encryptionIv, uploaderId: String(raw.uploaderId || raw.uploader_id || ''), uploaderName: String(raw.uploaderName || '').slice(0, 24) };
+        const result = { id, name, mimeType, sizeBytes, encryptedSizeBytes, encryptionIv, uploaderId: String(raw.uploaderId || raw.uploader_id || ''), uploaderName: String(raw.uploaderName || '').slice(0, 24) };
+        const version = Number(raw.encryptionVersion || raw.encryption_version || 1);
+        if (version === 2) { result.encryptionVersion = 2; result.chunkSizeBytes = Math.max(65536, Math.min(4 * 1024 * 1024, Number(raw.chunkSizeBytes) || VIDEO_CHUNK_BYTES)); }
+        if (raw.previewFileId) {
+          result.previewFileId = String(raw.previewFileId).slice(0, 80);
+          result.previewMimeType = String(raw.previewMimeType || 'video/mp4').slice(0, 180);
+          result.previewSizeBytes = Number(raw.previewSizeBytes) || 0;
+          result.previewEncryptedSizeBytes = Number(raw.previewEncryptedSizeBytes) || 0;
+          result.previewEncryptionIv = String(raw.previewEncryptionIv || '').slice(0, 200);
+          result.previewEncryptionVersion = Number(raw.previewEncryptionVersion) || 1;
+          result.previewChunkSizeBytes = Number(raw.previewChunkSizeBytes) || VIDEO_CHUNK_BYTES;
+        }
+        return result;
       }).filter(Boolean);
     }
-    async function uploadAttachmentFile(file) {
-      if (!supabaseClient) throw new Error('Không tải được thư viện Supabase. Hãy tải lại trang.');
-      if (file.size > MAX_ATTACHMENT_BYTES) throw new Error(`${file.name}: file tối đa 50 MiB.`);
-      const key = await deriveRoomFileKey();
-      const iv = crypto.getRandomValues(new Uint8Array(12));
-      const plainBuffer = await file.arrayBuffer();
-      const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBuffer);
-      const encryptedBlob = new Blob([cipherBuffer], { type: 'application/octet-stream' });
+    function makeChunkIv(baseIv, chunkIndex) {
+      const iv = new Uint8Array(12);
+      iv.set(baseIv.slice(0, 8), 0);
+      new DataView(iv.buffer).setUint32(8, chunkIndex, false);
+      return iv;
+    }
+    async function encryptBlobInChunks(blob, key, baseIv, chunkSize = VIDEO_CHUNK_BYTES) {
+      const parts = [];
+      const total = Math.ceil(blob.size / chunkSize);
+      for (let index = 0; index < total; index++) {
+        const plain = await blob.slice(index * chunkSize, Math.min(blob.size, (index + 1) * chunkSize)).arrayBuffer();
+        const cipher = await crypto.subtle.encrypt({ name: 'AES-GCM', iv: makeChunkIv(baseIv, index) }, key, plain);
+        parts.push(cipher);
+      }
+      return new Blob(parts, { type: 'application/octet-stream' });
+    }
+    async function initAndUploadEncryptedBlob({ name, mimeType, sizeBytes, encryptedBlob, encryptionIv }) {
       const init = await callRoomApi('upload-init', {
         roomCode: roomId, password: roomPasswordPlain,
-        originalName: file.name, mimeType: file.type || 'application/octet-stream',
-        sizeBytes: file.size, encryptedSizeBytes: encryptedBlob.size,
-        encryptionIv: bytesToBase64(iv), uploaderId: currentClientKey
+        originalName: name, mimeType: mimeType || 'application/octet-stream',
+        sizeBytes, encryptedSizeBytes: encryptedBlob.size,
+        encryptionIv: bytesToBase64(encryptionIv), uploaderId: currentClientKey
       });
       try {
         const { error } = await supabaseClient.storage.from(SUPABASE_BUCKET).uploadToSignedUrl(
@@ -1109,13 +1324,151 @@
         if (error) throw error;
       } catch (error) {
         callRoomApi('cancel-upload', { roomCode: roomId, password: roomPasswordPlain, fileId: init.file && init.file.id }).catch(() => {});
-        throw new Error(`Tải ${file.name} lên thất bại: ${error.message || 'lỗi lưu trữ'}`);
+        throw new Error(`Tải ${name} lên thất bại: ${error.message || 'lỗi lưu trữ'}`);
       }
       const row = init.file || {};
-      return { id: row.id, name: row.original_name || file.name, mimeType: row.mime_type || file.type || 'application/octet-stream', sizeBytes: Number(row.size_bytes ?? file.size), encryptedSizeBytes: Number(row.encrypted_size_bytes ?? encryptedBlob.size), encryptionIv: row.encryption_iv || bytesToBase64(iv), uploaderId: currentClientKey, uploaderName: myUsername };
+      return { id: row.id, name: row.original_name || name, mimeType: row.mime_type || mimeType || 'application/octet-stream', sizeBytes: Number(row.size_bytes ?? sizeBytes), encryptedSizeBytes: Number(row.encrypted_size_bytes ?? encryptedBlob.size), encryptionIv: row.encryption_iv || bytesToBase64(encryptionIv), uploaderId: currentClientKey, uploaderName: myUsername };
+    }
+    async function createFragmentedMp4Preview(file) {
+      if (!(file.type === 'video/mp4' || /\.mp4$/i.test(file.name))) return null;
+      if (!window.MP4Box) throw new Error('Thư viện MP4Box chưa tải được nên không thể tạo bản xem trước MP4 theo đoạn.');
+      // The preview is a separate, encrypted fMP4 copy. The original uploaded file remains byte-for-byte unchanged.
+      const mp4 = window.MP4Box.createFile();
+      const outputSegments = [];
+      let initSegment = null;
+      let resolveReady, rejectReady;
+      const ready = new Promise((resolve, reject) => { resolveReady = resolve; rejectReady = reject; });
+      let readyFinished = false;
+      let outputMimeType = 'video/mp4';
+      mp4.onError = (error) => { if (!readyFinished) { readyFinished = true; rejectReady(new Error(String(error || 'Không phân tích được MP4.'))); } };
+      mp4.onReady = (info) => {
+        try {
+          if (!info.tracks || !info.tracks.some(track => track.video)) throw new Error('File không có track video hợp lệ.');
+          if (typeof info.mime === 'string' && info.mime.includes('video/mp4')) outputMimeType = info.mime;
+          for (const track of info.tracks.filter(track => track.video || track.audio)) mp4.setSegmentOptions(track.id, track.id, { nbSamples: 120, rapAlignement: true, normalizeAudioSampleEntriesForMSE: true });
+          const init = mp4.initializeSegmentation('combined');
+          if (Array.isArray(init)) initSegment = new Blob(init.map(item => item.buffer), { type: 'video/mp4' });
+          else if (init && init.buffer) initSegment = new Blob([init.buffer], { type: 'video/mp4' });
+          if (!initSegment || !initSegment.size) throw new Error('Không tạo được đoạn khởi tạo MP4.');
+          mp4.onSegment = (_id, _user, buffer) => { if (buffer && buffer.byteLength) outputSegments.push(buffer.slice(0)); };
+          mp4.start();
+          if (!readyFinished) { readyFinished = true; resolveReady(info); }
+        } catch (error) { if (!readyFinished) { readyFinished = true; rejectReady(error); } }
+      };
+      // Feed MP4Box incrementally instead of allocating another full-file ArrayBuffer.
+      for (let offset = 0; offset < file.size; offset += VIDEO_CHUNK_BYTES) {
+        const source = await file.slice(offset, Math.min(file.size, offset + VIDEO_CHUNK_BYTES)).arrayBuffer();
+        source.fileStart = offset;
+        mp4.appendBuffer(source);
+      }
+      await ready;
+      mp4.flush();
+      // MP4Box emits its generated media fragments synchronously as samples are flushed.
+      if (!outputSegments.length) throw new Error('Không tạo được các đoạn video để phát trực tuyến.');
+      return { blob: new Blob([initSegment, ...outputSegments], { type: 'video/mp4' }), mimeType: outputMimeType };
+    }
+    async function uploadAttachmentFile(file) {
+      if (!supabaseClient) throw new Error('Không tải được thư viện Supabase. Hãy tải lại trang.');
+      if (file.size > MAX_ATTACHMENT_BYTES) throw new Error(`${file.name}: file tối đa 50 MiB.`);
+      const key = await deriveRoomFileKey();
+      const isVideo = (file.type || '').startsWith('video/') || /\.(mp4|m4v|webm|mov|mkv|avi)$/i.test(file.name);
+      if (!isVideo) {
+        const iv = crypto.getRandomValues(new Uint8Array(12));
+        const plainBuffer = await file.arrayBuffer();
+        const cipherBuffer = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, plainBuffer);
+        const encryptedBlob = new Blob([cipherBuffer], { type: 'application/octet-stream' });
+        return initAndUploadEncryptedBlob({ name: file.name, mimeType: file.type || 'application/octet-stream', sizeBytes: file.size, encryptedBlob, encryptionIv: iv });
+      }
+      // New video files use independently authenticated AES-GCM chunks for bounded-memory playback.
+      const iv = crypto.getRandomValues(new Uint8Array(12));
+      let encryptedBlob = await encryptBlobInChunks(file, key, iv, VIDEO_CHUNK_BYTES);
+      const original = await initAndUploadEncryptedBlob({ name: file.name, mimeType: file.type || 'video/mp4', sizeBytes: file.size, encryptedBlob, encryptionIv: iv });
+      encryptedBlob = null;
+      original.encryptionVersion = 2;
+      original.chunkSizeBytes = VIDEO_CHUNK_BYTES;
+      // MP4 files get a fragmented streaming copy for MSE; the original remains available for exact download.
+      if (file.type === 'video/mp4' || /\.mp4$/i.test(file.name)) {
+        try {
+          const preview = await createFragmentedMp4Preview(file);
+          if (preview && preview.blob && preview.blob.size) {
+            const previewIv = crypto.getRandomValues(new Uint8Array(12));
+            const previewSizeBytes = preview.blob.size;
+            const previewMimeType = preview.mimeType || 'video/mp4';
+            const encryptedPreview = await encryptBlobInChunks(preview.blob, key, previewIv, VIDEO_CHUNK_BYTES);
+            preview.blob = null;
+            const previewFile = await initAndUploadEncryptedBlob({ name: `${file.name.slice(0, 210)}.stream-preview.mp4`, mimeType: previewMimeType, sizeBytes: previewSizeBytes, encryptedBlob: encryptedPreview, encryptionIv: previewIv });
+            original.previewFileId = previewFile.id;
+            original.previewMimeType = previewMimeType;
+            original.previewSizeBytes = previewSizeBytes;
+            original.previewEncryptedSizeBytes = encryptedPreview.size;
+            original.previewEncryptionIv = previewFile.encryptionIv;
+            original.previewEncryptionVersion = 2;
+            original.previewChunkSizeBytes = VIDEO_CHUNK_BYTES;
+          }
+        } catch (error) {
+          console.warn('Could not make a fragmented MP4 preview; streaming may depend on the source format:', error);
+          showToast('Video gốc đã tải lên; không tạo được bản xem trước phân đoạn cho file này.', '');
+        }
+      }
+      return original;
+    }
+    async function getAttachmentSignedUrl(fileId) {
+      const result = await callRoomApi('download-url', { roomCode: roomId, password: roomPasswordPlain, fileId });
+      if (!result || !result.signedUrl) throw new Error('Máy chủ không trả về liên kết tải file.');
+      return result.signedUrl;
+    }
+    async function openEncryptedObjectStream(fileId, signal) {
+      const signedUrl = await getAttachmentSignedUrl(fileId);
+      const response = await fetch(signedUrl, { cache: 'no-store', signal });
+      if (!response.ok) throw new Error(`Không tải được file (HTTP ${response.status}).`);
+      if (!response.body || typeof response.body.getReader !== 'function') throw new Error('Trình duyệt không hỗ trợ đọc luồng tải xuống theo từng đoạn.');
+      return { reader: response.body.getReader(), state: { queue: [], headOffset: 0, bufferedBytes: 0, done: false } };
+    }
+    async function readExactEncryptedChunk(reader, length, state) {
+      while (state.bufferedBytes < length && !state.done) {
+        const { value, done } = await reader.read();
+        if (done) { state.done = true; break; }
+        if (!value || !value.byteLength) continue;
+        state.queue.push(value); state.bufferedBytes += value.byteLength;
+      }
+      if (state.bufferedBytes < length) throw new Error('File mã hóa bị thiếu dữ liệu hoặc bị ngắt giữa chừng.');
+      const result = new Uint8Array(length);
+      let written = 0;
+      while (written < length) {
+        const head = state.queue[0];
+        const available = head.byteLength - state.headOffset;
+        const take = Math.min(available, length - written);
+        result.set(head.subarray(state.headOffset, state.headOffset + take), written);
+        written += take; state.headOffset += take; state.bufferedBytes -= take;
+        if (state.headOffset >= head.byteLength) { state.queue.shift(); state.headOffset = 0; }
+      }
+      return result;
+    }
+    async function decryptChunkedAttachmentToBlob(attachment, options = {}) {
+      const chunkSize = Math.max(65536, Number(attachment.chunkSizeBytes) || VIDEO_CHUNK_BYTES);
+      const chunks = Math.ceil(attachment.sizeBytes / chunkSize);
+      const key = await deriveRoomFileKey();
+      const baseIv = base64ToBytes(attachment.encryptionIv);
+      const controller = options.controller || new AbortController();
+      let reader = null;
+      const parts = [];
+      try {
+        const opened = await openEncryptedObjectStream(attachment.id, controller.signal);
+        reader = opened.reader;
+        for (let index = 0; index < chunks; index++) {
+          const plainLength = Math.min(chunkSize, attachment.sizeBytes - index * chunkSize);
+          const cipher = await readExactEncryptedChunk(reader, plainLength + 16, opened.state);
+          const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: makeChunkIv(baseIv, index) }, key, cipher);
+          parts.push(plain);
+        }
+        return new Blob(parts, { type: attachment.mimeType || 'application/octet-stream' });
+      } finally {
+        if (reader) { try { await reader.cancel(); } catch (_) {} }
+      }
     }
     async function decryptAttachment(attachment) {
-      const { signedUrl } = await callRoomApi('download-url', { roomCode: roomId, password: roomPasswordPlain, fileId: attachment.id });
+      if (Number(attachment.encryptionVersion) === 2) return decryptChunkedAttachmentToBlob(attachment);
+      const signedUrl = await getAttachmentSignedUrl(attachment.id);
       const response = await fetch(signedUrl, { cache: 'no-store' });
       if (!response.ok) throw new Error(`Không tải được file (HTTP ${response.status}).`);
       const cipherBuffer = await response.arrayBuffer();
@@ -1139,6 +1492,11 @@
       try { const blob = await decryptAttachment(attachment); downloadBlob(blob, attachment.name); }
       catch (error) { console.error(error); showToast(error.message || 'Không thể tải file.', 'error'); }
     }
+    function cancelAttachmentUpload(attachment) {
+      if (!attachment) return;
+      const ids = [attachment.id, attachment.previewFileId].filter(Boolean);
+      ids.forEach(fileId => callRoomApi('cancel-upload', { roomCode: roomId, password: roomPasswordPlain, fileId }).catch(() => {}));
+    }
     function createAttachmentCard(attachment) {
       const card = document.createElement('div'); card.className = 'attachment-card';
       const footer = document.createElement('div'); footer.className = 'attachment-card-footer';
@@ -1151,21 +1509,193 @@
       const download = document.createElement('button'); download.type = 'button'; download.className = 'attachment-download'; download.textContent = 'Tải xuống';
       download.addEventListener('click', () => downloadAttachment(attachment));
       footer.append(icon, copy, download);
-      if (attachment.mimeType.startsWith('image/') || attachment.mimeType.startsWith('video/')) {
+      const mime = String(attachment.mimeType || '').toLowerCase();
+      if (mime.startsWith('image/') || mime.startsWith('video/') || mime.startsWith('audio/')) {
         const mediaWrap = document.createElement('div'); mediaWrap.className = 'attachment-media';
-        const placeholder = document.createElement('div'); placeholder.className = 'attachment-loading'; placeholder.textContent = 'Đang giải mã bản xem trước…'; mediaWrap.appendChild(placeholder);
-        getAttachmentObjectUrl(attachment).then(url => {
-          if (!mediaWrap.isConnected) return;
-          mediaWrap.replaceChildren();
-          if (attachment.mimeType.startsWith('image/')) {
-            const img = document.createElement('img'); img.src = url; img.alt = attachment.name; img.loading = 'lazy'; img.addEventListener('click', () => window.open(url, '_blank', 'noopener,noreferrer')); mediaWrap.appendChild(img);
-          } else {
-            const video = document.createElement('video'); video.src = url; video.controls = true; video.playsInline = true; video.preload = 'metadata'; mediaWrap.appendChild(video);
-          }
-        }).catch(error => { if (mediaWrap.isConnected) { const msg = document.createElement('div'); msg.className = 'attachment-error'; msg.textContent = 'Không thể xem trước file. Hãy thử tải xuống.'; mediaWrap.replaceChildren(msg); } console.warn('Attachment preview failed:', error); });
+        const placeholder = document.createElement('div'); placeholder.className = 'attachment-loading';
+        placeholder.textContent = mime.startsWith('video/') ? 'Nhấn để phát video theo từng đoạn' : mime.startsWith('audio/') ? 'Nhấn để tải và nghe âm thanh' : 'Đang chờ xem trước';
+        mediaWrap.appendChild(placeholder);
+        if (mime.startsWith('video/')) {
+          let previewVideo = null;
+          const play = document.createElement('button'); play.type = 'button'; play.className = 'attachment-download'; play.textContent = 'Phát video';
+          play.addEventListener('click', async () => {
+            play.disabled = true; play.textContent = 'Đang chuẩn bị video…';
+            try {
+              const video = previewVideo = document.createElement('video'); video.controls = true; video.playsInline = true; video.preload = 'none'; video.style.width = '100%'; video.style.maxHeight = '360px';
+              const status = document.createElement('div'); status.className = 'attachment-loading'; status.textContent = 'Đang tải các đoạn video đầu tiên…';
+              mediaWrap.replaceChildren(video, status);
+              await streamEncryptedVideo(attachment, video, status);
+              play.remove();
+            } catch (error) {
+              console.warn('Chunked video preview failed:', error);
+              if (previewVideo && previewVideo.src && previewVideo.src.startsWith('blob:')) { try { URL.revokeObjectURL(previewVideo.src); } catch (_) {} }
+              if (activeVideoObjectUrls.has(attachment.id)) { try { URL.revokeObjectURL(activeVideoObjectUrls.get(attachment.id)); } catch (_) {} activeVideoObjectUrls.delete(attachment.id); }
+              const msg = document.createElement('div'); msg.className = 'attachment-error'; msg.textContent = error.message || 'Không thể phát theo từng đoạn. Hãy tải video về xem.';
+              mediaWrap.replaceChildren(msg);
+              play.disabled = false; play.textContent = 'Thử phát lại'; mediaWrap.appendChild(play);
+            }
+          });
+          mediaWrap.appendChild(play);
+        } else if (mime.startsWith('audio/')) {
+          const audio = document.createElement('audio'); audio.controls = true; audio.preload = 'none'; audio.style.width = '100%'; audio.hidden = true;
+          const listen = document.createElement('button'); listen.type = 'button'; listen.className = 'attachment-download'; listen.textContent = 'Nghe âm thanh';
+          let loadingAudio = false;
+          listen.addEventListener('click', async () => {
+            if (loadingAudio) return;
+            loadingAudio = true; listen.disabled = true; listen.textContent = 'Đang tải và giải mã…';
+            try {
+              const url = await getAttachmentObjectUrl(attachment);
+              if (!mediaWrap.isConnected) return;
+              audio.src = url; audio.hidden = false; audio.load(); listen.textContent = 'Âm thanh đã sẵn sàng';
+              await audio.play().catch(() => {});
+              listen.remove(); placeholder.remove();
+            } catch (error) {
+              listen.disabled = false; listen.textContent = 'Thử nghe lại'; loadingAudio = false;
+              showToast(error.message || 'Không thể xem trước âm thanh.', 'error');
+            }
+          });
+          mediaWrap.append( audio, listen );
+        } else {
+          const loadImage = async () => {
+            if (mediaWrap.dataset.loaded === '1') return;
+            mediaWrap.dataset.loaded = '1';
+            try {
+              const url = await getAttachmentObjectUrl(attachment);
+              if (!mediaWrap.isConnected) return;
+              const img = document.createElement('img'); img.src = url; img.alt = attachment.name; img.loading = 'lazy';
+              img.addEventListener('click', () => window.open(url, '_blank', 'noopener,noreferrer'));
+              mediaWrap.replaceChildren(img);
+            } catch (error) {
+              const msg = document.createElement('div'); msg.className = 'attachment-error'; msg.textContent = 'Không thể xem trước file. Hãy thử tải xuống.'; mediaWrap.replaceChildren(msg);
+            }
+          };
+          if ('IntersectionObserver' in window) {
+            const observer = new IntersectionObserver(entries => { if (entries.some(entry => entry.isIntersecting)) { observer.disconnect(); loadImage(); } }, { rootMargin: '180px' });
+            observer.observe(mediaWrap);
+          } else loadImage();
+        }
         card.append(mediaWrap, footer);
       } else card.appendChild(footer);
       return card;
+    }
+    function waitForSourceBufferIdle(sourceBuffer, mediaSource) {
+      if (!sourceBuffer.updating) return Promise.resolve();
+      return new Promise((resolve, reject) => {
+        const done = () => { cleanup(); resolve(); };
+        const fail = () => { cleanup(); reject(new Error('Bộ đệm video báo lỗi.')); };
+        const cleanup = () => { sourceBuffer.removeEventListener('updateend', done); sourceBuffer.removeEventListener('error', fail); };
+        sourceBuffer.addEventListener('updateend', done, { once: true });
+        sourceBuffer.addEventListener('error', fail, { once: true });
+        if (mediaSource && mediaSource.readyState === 'closed') fail();
+      });
+    }
+    async function appendVideoData(sourceBuffer, mediaSource, data, video) {
+      await waitForSourceBufferIdle(sourceBuffer, mediaSource);
+      const oldEdge = video.currentTime - VIDEO_KEEP_BACK_SECONDS;
+      if (oldEdge > 0 && sourceBuffer.buffered.length && sourceBuffer.buffered.start(0) < oldEdge) {
+        try {
+          sourceBuffer.remove(0, Math.max(0.01, oldEdge));
+          await waitForSourceBufferIdle(sourceBuffer, mediaSource);
+        } catch (error) { console.debug('Could not trim old video buffer:', error); }
+      }
+      sourceBuffer.appendBuffer(data);
+      await waitForSourceBufferIdle(sourceBuffer, mediaSource);
+    }
+    async function streamEncryptedVideo(attachment, video, statusNode) {
+      const runId = makeId(); activeVideoStreams.set(attachment.id, runId);
+      const controller = new AbortController(); activeVideoControllers.set(attachment.id, controller);
+      const sourceFile = attachment.previewFileId ? {
+        id: attachment.previewFileId, name: `${attachment.name} (preview)`,
+        mimeType: attachment.previewMimeType || 'video/mp4', sizeBytes: attachment.previewSizeBytes,
+        encryptedSizeBytes: attachment.previewEncryptedSizeBytes, encryptionIv: attachment.previewEncryptionIv,
+        encryptionVersion: attachment.previewEncryptionVersion || 2, chunkSizeBytes: attachment.previewChunkSizeBytes || VIDEO_CHUNK_BYTES
+      } : attachment;
+      if (Number(sourceFile.encryptionVersion) !== 2) {
+        if (attachment.sizeBytes > 15 * 1024 * 1024) throw new Error('Video cũ chưa được mã hóa theo từng đoạn. Để tránh giữ cả video lớn trong RAM, hãy tải file về máy để xem.');
+        const url = await getAttachmentObjectUrl(attachment);
+        if (!video.isConnected) return;
+        video.src = url; video.preload = 'metadata';
+        if (statusNode && statusNode.isConnected) statusNode.remove();
+        await video.play().catch(() => {});
+        return;
+      }
+      if (!window.MediaSource) throw new Error('Trình duyệt này chưa hỗ trợ Media Source Extensions để phát video theo đoạn.');
+      let mime = String(sourceFile.mimeType || 'video/mp4');
+      const candidates = [mime];
+      if (/\.mp4|video\/mp4/i.test(mime)) candidates.push('video/mp4; codecs="avc1.42E01E,mp4a.40.2"', 'video/mp4; codecs="avc1.4D401E,mp4a.40.2"');
+      if (/webm/i.test(mime)) candidates.push('video/webm; codecs="vp8,vorbis"', 'video/webm; codecs="vp9,opus"');
+      if (mime === 'video/mp4') candidates.push('video/mp4; codecs="avc1.640028,mp4a.40.2"', 'video/mp4; codecs="avc1.64001F,mp4a.40.2"');
+      mime = candidates.find(candidate => MediaSource.isTypeSupported(candidate));
+      if (!mime) throw new Error('Trình duyệt không hỗ trợ phát trực tuyến định dạng video này. File không được tải toàn bộ vào RAM; hãy tải xuống để xem.');
+      const key = await deriveRoomFileKey();
+      const baseIv = base64ToBytes(sourceFile.encryptionIv);
+      const chunkSize = Math.max(65536, Number(sourceFile.chunkSizeBytes) || VIDEO_CHUNK_BYTES);
+      const chunkCount = Math.ceil(sourceFile.sizeBytes / chunkSize);
+      if (!chunkCount) throw new Error('Video rỗng.');
+      const mediaSource = new MediaSource();
+      const objectUrl = URL.createObjectURL(mediaSource);
+      const priorObjectUrl = activeVideoObjectUrls.get(attachment.id);
+      if (priorObjectUrl) URL.revokeObjectURL(priorObjectUrl);
+      activeVideoObjectUrls.set(attachment.id, objectUrl);
+      video.src = objectUrl; video.preload = 'auto';
+      const mediaOpen = new Promise((resolve, reject) => {
+        mediaSource.addEventListener('sourceopen', resolve, { once: true });
+        mediaSource.addEventListener('sourceclose', () => reject(new Error('Nguồn phát video đã bị đóng.')), { once: true });
+      });
+      await mediaOpen;
+      if (activeVideoStreams.get(attachment.id) !== runId || !video.isConnected) { URL.revokeObjectURL(objectUrl); controller.abort(); return; }
+      const sourceBuffer = mediaSource.addSourceBuffer(mime);
+      sourceBuffer.mode = 'segments';
+      const streamResponse = await fetch(await getAttachmentSignedUrl(sourceFile.id), { cache: 'no-store', signal: controller.signal });
+      if (!streamResponse.ok) throw new Error(`Không tải được video (HTTP ${streamResponse.status}).`);
+      if (!streamResponse.body || typeof streamResponse.body.getReader !== 'function') throw new Error('Trình duyệt không hỗ trợ tải video theo luồng; không tải cả video vào RAM.');
+      const streamReader = streamResponse.body.getReader();
+      const streamState = { queue: [], headOffset: 0, bufferedBytes: 0, done: false };
+      let played = false;
+      const enforceSeekWindow = () => {
+        if (!sourceBuffer.buffered.length) return;
+        const earliest = sourceBuffer.buffered.start(0);
+        if (video.currentTime < earliest - 0.5) {
+          video.currentTime = earliest;
+          showToast('Đoạn video cũ đã được giải phóng khỏi bộ nhớ; tua lùi chỉ còn trong vùng đệm.', '');
+        }
+      };
+      video.addEventListener('seeking', enforceSeekWindow);
+      const canContinue = () => activeVideoStreams.get(attachment.id) === runId && video.isConnected && !controller.signal.aborted;
+      const waitForBufferWindow = async () => {
+        while (canContinue()) {
+          if (video.paused && played) { await new Promise(resolve => setTimeout(resolve, 450)); continue; }
+          if (!sourceBuffer.buffered.length || sourceBuffer.buffered.end(sourceBuffer.buffered.length - 1) <= video.currentTime + VIDEO_BUFFER_AHEAD_SECONDS) return;
+          if (statusNode && statusNode.isConnected) statusNode.textContent = 'Đang phát; chỉ giữ một phần video quanh vị trí hiện tại trong bộ nhớ…';
+          await new Promise(resolve => setTimeout(resolve, 450));
+        }
+      };
+      try {
+        for (let index = 0; index < chunkCount; index++) {
+          if (!canContinue()) throw new DOMException('Đã dừng xem trước video.', 'AbortError');
+          if (index >= VIDEO_PREBUFFER_CHUNKS) await waitForBufferWindow();
+          if (!canContinue()) throw new DOMException('Đã dừng xem trước video.', 'AbortError');
+          const plainLength = Math.min(chunkSize, sourceFile.sizeBytes - index * chunkSize);
+          const cipher = await readExactEncryptedChunk(streamReader, plainLength + 16, streamState);
+          const plain = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: makeChunkIv(baseIv, index) }, key, cipher);
+          await appendVideoData(sourceBuffer, mediaSource, plain, video);
+          if (index === Math.min(VIDEO_PREBUFFER_CHUNKS, chunkCount) - 1 && !played) {
+            played = true;
+            if (statusNode && statusNode.isConnected) statusNode.textContent = 'Đang phát video; tải tiếp theo nhu cầu…';
+            await video.play().catch(() => { if (statusNode && statusNode.isConnected) statusNode.textContent = 'Nhấn Play để bắt đầu; video sẽ tiếp tục tải từng đoạn.'; });
+          }
+        }
+        if (mediaSource.readyState === 'open' && !sourceBuffer.updating) mediaSource.endOfStream();
+        if (statusNode && statusNode.isConnected) statusNode.textContent = 'Đã tải hết video; phần đã xem trước được giới hạn trong bộ đệm của trình phát.';
+      } catch (error) {
+        controller.abort();
+        throw error;
+      } finally {
+        try { await streamReader.cancel(); } catch (_) {}
+        video.removeEventListener('seeking', enforceSeekWindow);
+        if (activeVideoStreams.get(attachment.id) === runId) activeVideoStreams.delete(attachment.id);
+        if (activeVideoControllers.get(attachment.id) === controller) activeVideoControllers.delete(attachment.id);
+      }
     }
     function renderMessageAttachments(message, stack) {
       const attachments = normalizeSharedAttachments(message.attachments);
@@ -1521,11 +2051,6 @@
     async function beginJoin(password) {
       if (joining) return;
       forceClientOnlyJoin = false;
-      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
-      hostDataReconnectTimer = null;
-      hostDataReconnectAttempts = 0;
-      hostDataConnecting = false;
-      hostDataReconnectNoticeShown = false;
       roomPasswordPlain = String(password || '');
       joining = true;
       $('join-button').disabled = true;
@@ -1535,9 +2060,6 @@
       micMuted = false;
       leaving = false;
       try {
-        if (typeof window.Peer !== 'function') {
-          throw new Error('Không tải được thư viện PeerJS. Hãy tải lại trang; nếu vẫn lỗi, mạng/trình duyệt có thể đang chặn unpkg.com và cdn.jsdelivr.net.');
-        }
         const roomRegistration = await callRoomApi('create-or-join', { roomCode: roomId, password: roomPasswordPlain });
         supabaseRoomId = String(roomRegistration.roomId || '');
         supabaseHostToken = roomRegistration.isHost ? String(roomRegistration.hostToken || '') : '';
@@ -1551,6 +2073,7 @@
         updateMicButton();
         roomPasswordHash = await hashString(`secure-voice-room:v1:${roomId.toLowerCase()}:${password}`);
         hostId = `svr-${(await hashString(`secure-voice-room-id:${roomId.toLowerCase()}`)).slice(0, 40)}`;
+        await setupRoomSignaling();
         $('login-screen').classList.add('hidden');
         $('room-screen').classList.remove('hidden');
         requestScreenWakeLock(true);
@@ -1585,20 +2108,20 @@
 
     function attemptHostClaim() {
       if (leaving) return;
-      hostAttemptHandled = false;
-      try { hostPeer = new Peer(hostId, makePeerOptions());
-        attachPeerSignalingRecovery(hostPeer, 'chủ phòng');
-      }
+      hostAttemptHandled = true;
+      clearTimeout(hostAttemptTimer);
+      try { hostPeer = new Peer(hostId, { debug: 0 }); }
       catch (error) {
-        console.warn('Could not create room host Peer:', error);
-        handleHostClaimFailure({ type: 'peer-constructor-error' });
-        return;
+        console.warn('Could not create Supabase-signaled room host:', error);
+        showToast('Không khởi tạo được WebRTC. Hãy kiểm tra trình duyệt và thử lại.', 'error');
+        leaveRoom(true); return;
       }
+      peer = hostPeer;
       const thisAttempt = hostPeer;
+      thisAttempt.on('connection', handleIncomingDataConnection);
+      thisAttempt.on('call', handleHostIncomingCall);
       thisAttempt.on('open', () => {
-        if (hostAttemptHandled || leaving || hostPeer !== thisAttempt) return;
-        hostAttemptHandled = true;
-        clearTimeout(hostAttemptTimer);
+        if (leaving || hostPeer !== thisAttempt) return;
         isHost = true;
         myPeerId = hostId;
         usersData[myPeerId] = { id: myPeerId, name: myUsername, avatar: myAvatar, isSpeaking: false, joinedAt: Date.now(), clientKey: currentClientKey, mutedByHost: false, chatBlocked: false, deafenedByHost: false };
@@ -1613,35 +2136,13 @@
         applyLocalModerationState();
         startRoomHeartbeat();
         startLatencyMonitor();
-        showToast('Bạn đã trở thành chủ phòng.', 'success');
-        thisAttempt.on('connection', handleIncomingDataConnection);
-        thisAttempt.on('call', handleHostIncomingCall);
+        showToast('Phòng đã sẵn sàng qua Supabase Realtime.', 'success');
       });
       thisAttempt.on('error', (err) => {
         if (leaving || hostPeer !== thisAttempt) return;
-        if (err && err.type === 'unavailable-id' && !hostAttemptHandled) {
-          handleHostClaimFailure(err);
-        } else if (isHost) {
-          console.warn('Peer host error:', err);
-          const signalError = err && ['network', 'server-error', 'socket-error', 'socket-closed', 'ssl-unavailable', 'invalid-key', 'invalid-id', 'browser-incompatible'].includes(err.type);
-          if (signalError) {
-            setConnectionStatus('Lỗi kết nối PeerJS', 'offline');
-            showToast(peerErrorText(err), 'error');
-            if (thisAttempt.destroyed) {
-              Promise.resolve(closeBackendRoom({ timeoutMs: 4000 })).finally(() => { if (!leaving) leaveRoom(true); });
-            }
-          }
-        } else if (!hostAttemptHandled) {
-          console.warn('Peer room lookup error:', err);
-          handleHostClaimFailure(err);
-        }
+        console.warn('Supabase/WebRTC host error:', err);
+        if (err && err.type === 'network') setConnectionStatus('Lỗi kết nối', 'offline');
       });
-      hostAttemptTimer = window.setTimeout(() => {
-        if (!hostAttemptHandled && !leaving && hostPeer === thisAttempt) {
-          console.warn('PeerJS host open timed out.');
-          handleHostClaimFailure({ type: 'open-timeout' });
-        }
-      }, PEER_OPEN_TIMEOUT_MS);
     }
 
     function handleHostClaimFailure(error) {
@@ -1654,185 +2155,83 @@
     function startAsClient() {
       if (leaving) return;
       setConnectionStatus('Đang vào phòng', 'waiting');
-      let thisPeer;
-      try {
-        thisPeer = new Peer(makePeerOptions());
-      } catch (error) {
-        console.error('Could not create PeerJS client:', error);
-        showToast('Không khởi tạo được PeerJS. Hãy tải lại trang và kiểm tra kết nối mạng.', 'error');
-        leaveRoom(true);
-        return;
-      }
-      peer = thisPeer;
-      attachPeerSignalingRecovery(thisPeer, 'thành viên');
-      let roomConnectionStarted = false;
-      clientPeerOpenTimer = window.setTimeout(() => {
-        if (peer === thisPeer && !roomConnectionStarted && !leaving) {
-          console.error('PeerJS client did not emit open within the timeout.');
-          showToast('PeerJS không kết nối được máy chủ tín hiệu trong 15 giây. Kiểm tra mạng/VPN/tường lửa rồi thử lại.', 'error');
-          leaveRoom(true);
-        }
-      }, PEER_OPEN_TIMEOUT_MS);
-
-      thisPeer.on('open', (id) => {
-        if (leaving || peer !== thisPeer || roomConnectionStarted) return;
-        roomConnectionStarted = true;
-        clearTimeout(clientPeerOpenTimer);
-        clientPeerOpenTimer = null;
+      peer = new Peer({ debug: 0 });
+      peer.on('open', (id) => {
+        if (leaving) return;
         myPeerId = id;
-        thisPeer.on('call', handleIncomingPeerCall);
-        connectClientToHost(thisPeer);
-      });
-
-      thisPeer.on('error', (err) => {
-        console.warn('Peer client error:', err);
-        const type = err && err.type ? err.type : 'unknown';
-        if (!leaving && ['network', 'server-error', 'socket-error', 'socket-closed', 'ssl-unavailable', 'invalid-key', 'invalid-id', 'browser-incompatible'].includes(type)) {
-          setConnectionStatus('Lỗi kết nối PeerJS', 'offline');
-          showToast(peerErrorText(err), 'error');
-          if (thisPeer.destroyed) window.setTimeout(() => { if (!leaving && peer === thisPeer) leaveRoom(true); }, 300);
-        }
-      });
-    }
-
-    function scheduleHostDataReconnect(peerInstance) {
-      if (leaving || peer !== peerInstance || peerInstance.destroyed || hostDataReconnectTimer) return;
-      if (hostDataReconnectAttempts >= 6) {
-        showToast('Không thể khôi phục kết nối dữ liệu tới phòng sau nhiều lần thử. Hãy kiểm tra chủ phòng/mạng rồi vào lại.', 'error');
-        leaveRoom(true);
-        return;
-      }
-      const attempt = hostDataReconnectAttempts++;
-      const delay = Math.min(8000, 1000 * (2 ** Math.min(attempt, 3)));
-      hostDataReconnectTimer = window.setTimeout(() => {
-        hostDataReconnectTimer = null;
-        if (leaving || peer !== peerInstance || peerInstance.destroyed) return;
-        if (peerInstance.disconnected) {
-          scheduleHostDataReconnect(peerInstance);
-          return;
-        }
-        connectClientToHost(peerInstance);
-      }, delay);
-    }
-
-    function stopRemoteCallsForDataReconnect() {
-      Object.entries(mediaCalls).forEach(([id, call]) => {
-        delete mediaCalls[id];
-        clearTimeout(call && call._roomCallTimeout);
-        try { call.close(); } catch (_) {}
-        cleanupAudioMonitor(id);
-        removeAudioElement(id);
-      });
-      stopLatencyMonitor();
-    }
-
-    function handleHostDataConnectionFailure(conn, peerInstance, error) {
-      if (leaving || hostConnection !== conn) return;
-      if (error) console.warn('Room data connection lost; will retry:', error);
-      clearTimeout(conn._roomAuthTimer);
-      hostConnection = null;
-      hostDataConnecting = false;
-      try { conn.close(); } catch (_) {}
-      if (authAccepted) {
-        authAccepted = false;
-        $('message-input').disabled = true;
-        $('send-button').disabled = true;
-        stopLocalTyping();
-        stopRemoteCallsForDataReconnect();
-      }
-      setConnectionStatus('Đang khôi phục kết nối phòng', 'waiting');
-      if (!hostDataReconnectNoticeShown) {
-        hostDataReconnectNoticeShown = true;
-        showToast('Mất kết nối dữ liệu với chủ phòng. Đang tự thử kết nối lại…');
-      }
-      scheduleHostDataReconnect(peerInstance);
-    }
-
-    function connectClientToHost(peerInstance) {
-      if (leaving || peer !== peerInstance || peerInstance.destroyed || hostDataConnecting || hostConnection) return;
-      if (peerInstance.disconnected) {
-        scheduleHostDataReconnect(peerInstance);
-        return;
-      }
-      hostDataConnecting = true;
-      let conn;
-      try {
-        conn = peerInstance.connect(hostId, {
+        peer.on('call', handleIncomingPeerCall);
+        const conn = peer.connect(hostId, {
           reliable: true,
           metadata: { username: myUsername, avatar: myAvatar, passHash: roomPasswordHash, peerId: myPeerId, clientKey: currentClientKey }
         });
-      } catch (error) {
-        hostDataConnecting = false;
-        console.warn('Could not open data connection to room host:', error);
-        scheduleHostDataReconnect(peerInstance);
-        return;
-      }
-      if (!conn) {
-        hostDataConnecting = false;
-        scheduleHostDataReconnect(peerInstance);
-        return;
-      }
-      hostConnection = conn;
-      let authResponseReceived = false;
-      conn._roomAuthTimer = window.setTimeout(() => {
-        if (!authResponseReceived && !leaving && hostConnection === conn) {
-          handleHostDataConnectionFailure(conn, peerInstance, new Error('Timed out waiting for room authentication.'));
-        }
-      }, 15000);
-
-      conn.on('open', () => {
-        if (hostConnection === conn && !leaving) setConnectionStatus('Đang xác thực mật khẩu', 'waiting');
-      });
-      conn.on('data', (data) => {
-        if (hostConnection !== conn || leaving) return;
-        if (data && data.type === 'auth') {
-          authResponseReceived = true;
-          clearTimeout(conn._roomAuthTimer);
-          if (!data.ok) {
-            hostDataConnecting = false;
-            showToast(data.reason || 'Mật khẩu phòng không đúng.', 'error');
+        hostConnection = conn;
+        let authResponseReceived = false;
+        const authTimer = window.setTimeout(() => {
+          if (!authResponseReceived && !leaving) {
+            showToast('Không nhận được phản hồi từ chủ phòng. Kiểm tra ID, mật khẩu và trạng thái Supabase Realtime.', 'error');
             leaveRoom(true);
-            return;
           }
-          hostDataConnecting = false;
-          hostDataReconnectAttempts = 0;
-          hostDataReconnectNoticeShown = false;
-          if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
-          hostDataReconnectTimer = null;
-          authAccepted = true;
-          bannedClientKeys = new Set(Array.isArray(data.bannedClientKeys) ? data.bannedClientKeys.filter(key => typeof key === 'string') : []);
-          Object.keys(usersData).forEach((key) => delete usersData[key]);
-          (Array.isArray(data.members) ? data.members : []).forEach((member) => {
-            if (!member || !member.id) return;
-            usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt) || Date.now(), mutedByHost: !!member.mutedByHost, chatBlocked: !!member.chatBlocked, deafenedByHost: !!member.deafenedByHost };
-          });
-          const ownMember = usersData[myPeerId] || {};
-          usersData[myPeerId] = { ...ownMember, id: myPeerId, name: myUsername, avatar: myAvatar, clientKey: currentClientKey, isSpeaking: false, joinedAt: Number(ownMember.joinedAt)||Date.now(), mutedByHost: !!ownMember.mutedByHost, chatBlocked: !!ownMember.chatBlocked, deafenedByHost: !!ownMember.deafenedByHost };
-          renderUserList();
-          setConnectionStatus('Đã kết nối', 'online');
-          $('message-input').disabled = false;
-          $('send-button').disabled = false;
-          monitorAudioActivity(localStream, myPeerId, true);
-          if (Array.isArray(data.history)) data.history.slice(-MAX_HISTORY).forEach((msg) => appendMessage(msg));
-          pinnedMessages = normalizePinnedMessages(data.pinnedMessages, data.pinnedMessage);
-          pinnedMessage = pinnedMessages[pinnedMessages.length - 1] || null;
-          renderPinnedMessage(); renderMessagePinnedState();
-          applyLocalModerationState();
-          startLatencyMonitor();
-          Object.values(usersData).forEach((member) => {
-            if (member.id !== myPeerId) connectAudioToMember(member);
-          });
-        } else if (authAccepted) {
-          handleClientRoomMessage(data);
+        }, 12000);
+        conn.on('open', () => setConnectionStatus('Đang xác thực mật khẩu', 'waiting'));
+        conn.on('data', (data) => {
+          if (data && data.type === 'auth') {
+            authResponseReceived = true;
+            clearTimeout(authTimer);
+            if (!data.ok) {
+              showToast(data.reason || 'Mật khẩu phòng không đúng.', 'error');
+              leaveRoom(true);
+              return;
+            }
+            authAccepted = true;
+            bannedClientKeys = new Set(Array.isArray(data.bannedClientKeys) ? data.bannedClientKeys.filter(key => typeof key === 'string') : []);
+            Object.keys(usersData).forEach((key) => delete usersData[key]);
+            (Array.isArray(data.members) ? data.members : []).forEach((member) => {
+              if (!member || !member.id) return;
+              usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt) || Date.now(), mutedByHost: !!member.mutedByHost, chatBlocked: !!member.chatBlocked, deafenedByHost: !!member.deafenedByHost };
+            });
+            const ownMember = usersData[myPeerId] || {};
+            usersData[myPeerId] = { ...ownMember, id: myPeerId, name: myUsername, avatar: myAvatar, clientKey: currentClientKey, isSpeaking: false, joinedAt: Number(ownMember.joinedAt)||Date.now(), mutedByHost: !!ownMember.mutedByHost, chatBlocked: !!ownMember.chatBlocked, deafenedByHost: !!ownMember.deafenedByHost };
+            renderUserList();
+            setConnectionStatus('Đã kết nối', 'online');
+            $('message-input').disabled = false;
+            $('send-button').disabled = false;
+            monitorAudioActivity(localStream, myPeerId, true);
+            if (Array.isArray(data.history)) data.history.slice(-MAX_HISTORY).forEach((msg) => appendMessage(msg));
+            pinnedMessages = normalizePinnedMessages(data.pinnedMessages, data.pinnedMessage);
+            pinnedMessage = pinnedMessages[pinnedMessages.length - 1] || null;
+            renderPinnedMessage(); renderMessagePinnedState();
+            applyLocalModerationState();
+            startLatencyMonitor();
+            // Người mới chủ động gọi các thành viên đã có; tránh hai bên gọi trùng nhau.
+            Object.values(usersData).forEach((member) => {
+              if (member.id !== myPeerId) connectAudioToMember(member);
+            });
+          } else if (authAccepted) {
+            handleClientRoomMessage(data);
+          }
+        });
+        conn.on('close', () => {
+          clearTimeout(authTimer);
+          if (!leaving && authAccepted) {
+            setConnectionStatus('Mất kết nối chủ phòng', 'offline');
+            showToast('Chủ phòng đã mất kết nối. Bạn sẽ rời phòng; dữ liệu sẽ được dọn khi heartbeat hết hạn.', 'error');
+            leaveRoom(true);
+          }
+        });
+        conn.on('error', (err) => {
+          console.warn('Data connection error:', err);
+          if (!authAccepted && !leaving) {
+            showToast('Không kết nối được tới phòng. Có thể ID chưa tồn tại hoặc chủ phòng đã ngoại tuyến.', 'error');
+            leaveRoom(true);
+          }
+        });
+      });
+      peer.on('error', (err) => {
+        console.warn('Peer client error:', err);
+        if (!leaving && ['network', 'server-error', 'socket-error'].includes(err.type)) {
+          setConnectionStatus('Lỗi kết nối', 'offline');
+          showToast('Có lỗi kết nối signaling/WebRTC. Hãy thử kết nối lại phòng.', 'error');
         }
-      });
-      conn.on('close', () => {
-        if (hostConnection !== conn || leaving) return;
-        handleHostDataConnectionFailure(conn, peerInstance);
-      });
-      conn.on('error', (err) => {
-        console.warn('PeerJS data connection error:', err);
-        if (hostConnection === conn && !leaving) handleHostDataConnectionFailure(conn, peerInstance, err);
       });
     }
 
@@ -1857,11 +2256,7 @@
         const avatar = typeof meta.avatar === 'string' && meta.avatar.length < 500000 ? meta.avatar : '';
         authenticated = true;
         conn._roomAuthed = true;
-        const previousConnection = dataConnections[id];
         dataConnections[id] = conn;
-        if (previousConnection && previousConnection !== conn) {
-          try { previousConnection.close(); } catch (_) {}
-        }
         usersData[id] = { id, name, avatar, clientKey, isSpeaking: false, joinedAt: Date.now(), mutedByHost: false, chatBlocked: false, deafenedByHost: false };
         try { conn.send({ type: 'auth', ok: true, members: getMembersPayload(), history: messageHistory.slice(-MAX_HISTORY), pinnedMessages, pinnedMessage, bannedClientKeys: [...bannedClientKeys] }); }
         catch (error) { console.warn('Cannot send auth response:', error); }
@@ -1869,8 +2264,6 @@
         renderUserList();
         playRoomSound('join');
         setConnectionStatus('Bạn là chủ phòng', 'online');
-        // Chủ phòng cũng là một peer thoại; chỉ đầu có ID nhỏ hơn sẽ khởi tạo cuộc gọi.
-        connectAudioToMember(usersData[id]);
       });
       conn.on('data', (data) => {
         if (authenticated && conn._roomAuthed) handleHostData(conn, data);
@@ -1878,8 +2271,6 @@
       conn.on('close', () => {
         if (!authenticated) return;
         const id = conn.peer;
-        // Bỏ qua sự kiện close từ kết nối cũ nếu cùng peer đã kết nối lại.
-        if (dataConnections[id] !== conn) return;
         delete dataConnections[id];
         if (usersData[id]) {
           updateTypingState(id, usersData[id].name, false);
@@ -1947,80 +2338,24 @@
     }
     function stopLatencyMonitor() { if (latencyTimer) clearInterval(latencyTimer); latencyTimer = null; }
 
-    function shouldInitiateAudio(peerId) {
-      return !!myPeerId && !!peerId && String(myPeerId) < String(peerId);
-    }
-
-    function scheduleAudioReconnect(peerId) {
-      if (leaving || !authAccepted || !peerId || peerId === myPeerId || !usersData[peerId]) return;
-      // Chỉ một phía được phép khởi tạo để tránh offer WebRTC đè lên nhau.
-      if (!shouldInitiateAudio(peerId) || audioReconnectTimers[peerId]) return;
-      const attempt = Number(audioReconnectAttempts[peerId] || 0);
-      const delay = Math.min(12000, 1000 * (2 ** Math.min(attempt, 3)));
-      audioReconnectAttempts[peerId] = attempt + 1;
-      audioReconnectTimers[peerId] = window.setTimeout(() => {
-        delete audioReconnectTimers[peerId];
-        if (leaving || !authAccepted || !usersData[peerId]) return;
-        if (!mediaCalls[peerId]) connectAudioToMember(usersData[peerId]);
-      }, delay);
-    }
-
     function connectAudioToMember(member) {
-      const activePeer = peer || hostPeer;
-      if (!member || !member.id || member.id === myPeerId || !activePeer || activePeer.destroyed || !localStream || !authAccepted) return;
-      if (!shouldInitiateAudio(member.id)) return;
-      if (activePeer.disconnected) { scheduleAudioReconnect(member.id); return; }
-      if (mediaCalls[member.id]) return;
+      if (!member || !member.id || member.id === myPeerId || !peer || !localStream || !authAccepted) return;
+      if (mediaCalls[member.id] && mediaCalls[member.id].open) return;
       try {
-        const call = activePeer.call(member.id, localStream, {
+        const call = peer.call(member.id, localStream, {
           metadata: { username: myUsername, avatar: myAvatar, passHash: roomPasswordHash }
         });
-        if (!call) {
-          scheduleAudioReconnect(member.id);
-          return;
-        }
+        if (!call) return;
         setupCallEvents(call, member.id, member.name, member.avatar);
-      } catch (error) {
-        console.warn('Unable to call member:', member.id, error);
-        scheduleAudioReconnect(member.id);
-      }
+      } catch (error) { console.warn('Unable to call member:', member.id, error); }
     }
 
     function setupCallEvents(call, peerId, username, avatar) {
       const existing = mediaCalls[peerId];
-      if (existing && existing !== call) {
-        try { existing._roomReplaced = true; existing.close(); } catch (_) {}
-      }
-      call._roomHasStream = false;
-      call._roomCleanupDone = false;
+      if (existing && existing !== call) { try { existing.close(); } catch (_) {} }
       mediaCalls[peerId] = call;
-
-      const finishCall = () => {
-        if (call._roomCleanupDone) return;
-        call._roomCleanupDone = true;
-        clearTimeout(call._roomCallTimeout);
-        // A late close/error from a replaced call must not tear down the new call's audio.
-        if (mediaCalls[peerId] !== call) return;
-        delete mediaCalls[peerId];
-        cleanupAudioMonitor(peerId);
-        removeAudioElement(peerId);
-        scheduleAudioReconnect(peerId);
-      };
-
-      call._roomCallTimeout = window.setTimeout(() => {
-        if (mediaCalls[peerId] !== call || call._roomHasStream || leaving) return;
-        console.warn('PeerJS media call timed out before receiving remote stream:', peerId);
-        try { call.close(); } catch (_) {}
-        finishCall();
-      }, MEDIA_CALL_TIMEOUT_MS);
-
       call.on('stream', (remoteStream) => {
-        if (leaving || mediaCalls[peerId] !== call) return;
-        call._roomHasStream = true;
-        clearTimeout(call._roomCallTimeout);
-        audioReconnectAttempts[peerId] = 0;
-        if (audioReconnectTimers[peerId]) clearTimeout(audioReconnectTimers[peerId]);
-        delete audioReconnectTimers[peerId];
+        if (leaving) return;
         playAudioStream(remoteStream, peerId);
         const current = usersData[peerId];
         if (current) {
@@ -2032,13 +2367,12 @@
         renderUserList();
         monitorAudioActivity(remoteStream, peerId, false);
       });
-      call.on('close', finishCall);
-      call.on('error', (err) => {
-        console.warn('Media call error:', peerId, err);
-        if (mediaCalls[peerId] !== call) return;
-        try { call.close(); } catch (_) {}
-        finishCall();
+      call.on('close', () => {
+        if (mediaCalls[peerId] === call) delete mediaCalls[peerId];
+        cleanupAudioMonitor(peerId);
+        removeAudioElement(peerId);
       });
+      call.on('error', (err) => console.warn('Media call error:', peerId, err));
     }
 
     function playAudioStream(stream, id) {
@@ -2243,7 +2577,6 @@
         const member = data.member;
         usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt)||Date.now(), mutedByHost:!!member.mutedByHost, chatBlocked:!!member.chatBlocked, deafenedByHost:!!member.deafenedByHost };
         renderUserList(); playRoomSound('join');
-        connectAudioToMember(usersData[member.id]);
       } else if (data.type === 'member_left' && data.id) {
         delete usersData[data.id];
         closeCallsForPeer(data.id);
@@ -2532,12 +2865,12 @@
       const uploadedAttachments = [];
       try {
         for (let index = 0; index < filesToUpload.length; index++) {
-          showToast(`Đang mã hóa và tải file ${index + 1}/${filesToUpload.length}…`);
+          showToast(`Đang mã hóa theo khối và tải file ${index + 1}/${filesToUpload.length}…`);
           uploadedAttachments.push(await uploadAttachmentFile(filesToUpload[index].file));
         }
       } catch (error) {
         console.error('Attachment upload failed:', error);
-        uploadedAttachments.forEach(file => callRoomApi('cancel-upload', { roomCode: roomId, password: roomPasswordPlain, fileId: file.id }).catch(() => {}));
+        uploadedAttachments.forEach(cancelAttachmentUpload);
         showToast(error.message || 'Không thể tải file lên.', 'error');
         sendButton.disabled = false; attachButton.disabled = false;
         return;
@@ -2560,7 +2893,7 @@
         showToast('Bạn chưa kết nối được tới phòng.', 'error');
       }
       if (!sent) {
-        uploadedAttachments.forEach(file => callRoomApi('cancel-upload', { roomCode: roomId, password: roomPasswordPlain, fileId: file.id }).catch(() => {}));
+        uploadedAttachments.forEach(cancelAttachmentUpload);
         sendButton.disabled = false; attachButton.disabled = false; return;
       }
       clearPendingAttachments();
@@ -2925,20 +3258,13 @@
       if (leaving) return;
       leaving = true;
       clearTimeout(hostAttemptTimer);
-      clearTimeout(clientPeerOpenTimer);
-      clientPeerOpenTimer = null;
-      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
-      hostDataReconnectTimer = null;
-      hostDataConnecting = false;
-      hostDataReconnectAttempts = 0;
-      hostDataReconnectNoticeShown = false;
-      Object.values(audioReconnectTimers).forEach(timer => clearTimeout(timer));
-      Object.keys(audioReconnectTimers).forEach(id => delete audioReconnectTimers[id]);
-      Object.keys(audioReconnectAttempts).forEach(id => delete audioReconnectAttempts[id]);
       if (roomHeartbeatTimer) clearInterval(roomHeartbeatTimer);
       roomHeartbeatTimer = null;
       clearTimeout(typingStopTimer);
       clearPendingAttachments();
+      activeVideoStreams.clear();
+      activeVideoControllers.forEach(controller => { try { controller.abort(); } catch (_) {} }); activeVideoControllers.clear();
+      activeVideoObjectUrls.forEach(url => { try { URL.revokeObjectURL(url); } catch (_) {} }); activeVideoObjectUrls.clear();
       attachmentObjectUrls.forEach(value => Promise.resolve(value).then(url => URL.revokeObjectURL(url)).catch(() => {}));
       attachmentObjectUrls.clear();
       await releaseScreenWakeLock();
@@ -2974,11 +3300,6 @@
     }
 
     async function stopMediaAndPeers() {
-      clearTimeout(clientPeerOpenTimer);
-      clientPeerOpenTimer = null;
-      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
-      hostDataReconnectTimer = null;
-      hostDataConnecting = false;
       try { if (hostConnection) hostConnection.close(); } catch (_) {}
       hostConnection = null;
       Object.values(mediaCalls).forEach((call) => { try { call.close(); } catch (_) {} });
@@ -2994,6 +3315,7 @@
       try { if (peer && !peer.destroyed) peer.destroy(); } catch (_) {}
       try { if (hostPeer && !hostPeer.destroyed) hostPeer.destroy(); } catch (_) {}
       peer = null; hostPeer = null;
+      await closeRoomSignaling();
       if (localStream) localStream.getTracks().forEach((track) => { try { track.stop(); } catch (_) {} });
       localStream = null;
     }
