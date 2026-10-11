@@ -823,7 +823,7 @@
   </div>
   <div id="toast-region" class="toast-region" aria-live="polite" aria-atomic="true"></div>
 
-  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js"></script>
+  <script src="https://unpkg.com/peerjs@1.5.4/dist/peerjs.min.js" onerror="this.onerror=null;const fallback=document.createElement('script');fallback.src='https://cdn.jsdelivr.net/npm/peerjs@1.5.4/dist/peerjs.min.js';document.head.appendChild(fallback);"></script>
   <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
   <script>
     'use strict';
@@ -896,6 +896,16 @@
     let authAccepted = false;
     let hostAttemptHandled = false;
     let hostAttemptTimer = null;
+    let clientPeerOpenTimer = null;
+    let hostDataReconnectTimer = null;
+    let hostDataReconnectAttempts = 0;
+    let hostDataConnecting = false;
+    let hostDataReconnectNoticeShown = false;
+    const audioReconnectTimers = Object.create(null);
+    const audioReconnectAttempts = Object.create(null);
+    const peerRecoveryStates = new WeakMap();
+    const PEER_OPEN_TIMEOUT_MS = 15000;
+    const MEDIA_CALL_TIMEOUT_MS = 20000;
     let pendingAvatar = '';
     let replyTarget = null;
     let selectedContextMessage = null;
@@ -931,6 +941,78 @@
         if (!response.ok || result.error || result.ok === false) throw new Error(result.error || `Supabase trả về lỗi HTTP ${response.status}.`);
         return result;
       } finally { window.clearTimeout(timeout); }
+    }
+
+    // PeerJS dùng máy chủ signaling riêng; Supabase ở đây chỉ quản lý phòng/heartbeat/file.
+    // Thêm STUN dự phòng và tự nối lại socket signaling khi mạng chập chờn.
+    function makePeerOptions() {
+      return {
+        debug: 1,
+        config: {
+          sdpSemantics: 'unified-plan',
+          iceServers: [
+            { urls: 'stun:stun.l.google.com:19302' },
+            { urls: 'stun:stun1.l.google.com:19302' },
+            { urls: 'stun:global.stun.twilio.com:3478' }
+          ]
+        }
+      };
+    }
+
+    function peerErrorText(error) {
+      const type = error && error.type ? String(error.type) : 'unknown';
+      const details = {
+        'browser-incompatible': 'Trình duyệt không hỗ trợ WebRTC. Hãy thử Chrome, Edge hoặc Firefox bản mới.',
+        'invalid-id': 'ID PeerJS không hợp lệ.',
+        'unavailable-id': 'ID PeerJS đang được một kết nối khác sử dụng.',
+        'peer-unavailable': 'Không tìm thấy đầu bên kia trên máy chủ tín hiệu PeerJS. Chủ phòng có thể đang ngoại tuyến.',
+        network: 'Không thể kết nối tới máy chủ tín hiệu PeerJS; hãy kiểm tra mạng, VPN hoặc tường lửa.',
+        'server-error': 'Máy chủ tín hiệu PeerJS trả về lỗi.',
+        'socket-error': 'Socket tín hiệu PeerJS gặp lỗi.',
+        'socket-closed': 'Socket tín hiệu PeerJS bị đóng đột ngột.',
+        'ssl-unavailable': 'Máy chủ PeerJS không hỗ trợ kết nối HTTPS cần thiết.',
+        webrtc: 'WebRTC không thiết lập được kết nối trực tiếp giữa hai thiết bị.'
+      };
+      return `${details[type] || 'PeerJS gặp lỗi kết nối.'} (mã lỗi: ${type}).`;
+    }
+
+    function attachPeerSignalingRecovery(peerInstance, label) {
+      const state = { timer: null, attempts: 0 };
+      peerRecoveryStates.set(peerInstance, state);
+      const clearRetry = () => {
+        if (state.timer) clearTimeout(state.timer);
+        state.timer = null;
+      };
+      const scheduleRetry = () => {
+        if (state.timer || leaving || peerInstance.destroyed) return;
+        const delay = Math.min(8000, 750 * (2 ** state.attempts));
+        state.timer = window.setTimeout(() => {
+          state.timer = null;
+          if (leaving || peerInstance.destroyed) return;
+          if (!peerInstance.disconnected) return;
+          state.attempts += 1;
+          try { peerInstance.reconnect(); }
+          catch (error) { console.warn(`PeerJS signaling reconnect failed (${label}):`, error); }
+          if (state.attempts < 6) scheduleRetry();
+          else showToast('Kết nối tín hiệu PeerJS vẫn chưa ổn định. Hãy kiểm tra mạng hoặc thử vào lại phòng.', 'error');
+        }, delay);
+      };
+      peerInstance.on('open', () => {
+        clearRetry();
+        state.attempts = 0;
+      });
+      peerInstance.on('disconnected', () => {
+        if (leaving) return;
+        console.warn(`PeerJS signaling disconnected (${label}).`);
+        setConnectionStatus('Đang khôi phục tín hiệu', 'waiting');
+        scheduleRetry();
+      });
+      peerInstance.on('error', (error) => {
+        console.warn(`PeerJS signaling error (${label}):`, error);
+        if (error && ['network', 'server-error', 'socket-error', 'socket-closed'].includes(error.type) && peerInstance.disconnected) {
+          scheduleRetry();
+        }
+      });
     }
 
     function startRoomHeartbeat() {
@@ -1439,6 +1521,11 @@
     async function beginJoin(password) {
       if (joining) return;
       forceClientOnlyJoin = false;
+      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
+      hostDataReconnectTimer = null;
+      hostDataReconnectAttempts = 0;
+      hostDataConnecting = false;
+      hostDataReconnectNoticeShown = false;
       roomPasswordPlain = String(password || '');
       joining = true;
       $('join-button').disabled = true;
@@ -1448,6 +1535,9 @@
       micMuted = false;
       leaving = false;
       try {
+        if (typeof window.Peer !== 'function') {
+          throw new Error('Không tải được thư viện PeerJS. Hãy tải lại trang; nếu vẫn lỗi, mạng/trình duyệt có thể đang chặn unpkg.com và cdn.jsdelivr.net.');
+        }
         const roomRegistration = await callRoomApi('create-or-join', { roomCode: roomId, password: roomPasswordPlain });
         supabaseRoomId = String(roomRegistration.roomId || '');
         supabaseHostToken = roomRegistration.isHost ? String(roomRegistration.hostToken || '') : '';
@@ -1496,7 +1586,9 @@
     function attemptHostClaim() {
       if (leaving) return;
       hostAttemptHandled = false;
-      try { hostPeer = new Peer(hostId, { debug: 0 }); }
+      try { hostPeer = new Peer(hostId, makePeerOptions());
+        attachPeerSignalingRecovery(hostPeer, 'chủ phòng');
+      }
       catch (error) {
         console.warn('Could not create room host Peer:', error);
         handleHostClaimFailure({ type: 'peer-constructor-error' });
@@ -1531,7 +1623,14 @@
           handleHostClaimFailure(err);
         } else if (isHost) {
           console.warn('Peer host error:', err);
-          if (err && ['network', 'server-error', 'socket-error'].includes(err.type)) setConnectionStatus('Lỗi kết nối', 'offline');
+          const signalError = err && ['network', 'server-error', 'socket-error', 'socket-closed', 'ssl-unavailable', 'invalid-key', 'invalid-id', 'browser-incompatible'].includes(err.type);
+          if (signalError) {
+            setConnectionStatus('Lỗi kết nối PeerJS', 'offline');
+            showToast(peerErrorText(err), 'error');
+            if (thisAttempt.destroyed) {
+              Promise.resolve(closeBackendRoom({ timeoutMs: 4000 })).finally(() => { if (!leaving) leaveRoom(true); });
+            }
+          }
         } else if (!hostAttemptHandled) {
           console.warn('Peer room lookup error:', err);
           handleHostClaimFailure(err);
@@ -1539,9 +1638,10 @@
       });
       hostAttemptTimer = window.setTimeout(() => {
         if (!hostAttemptHandled && !leaving && hostPeer === thisAttempt) {
+          console.warn('PeerJS host open timed out.');
           handleHostClaimFailure({ type: 'open-timeout' });
         }
-      }, 8000);
+      }, PEER_OPEN_TIMEOUT_MS);
     }
 
     function handleHostClaimFailure(error) {
@@ -1554,83 +1654,185 @@
     function startAsClient() {
       if (leaving) return;
       setConnectionStatus('Đang vào phòng', 'waiting');
-      peer = new Peer({ debug: 0 });
-      peer.on('open', (id) => {
-        if (leaving) return;
+      let thisPeer;
+      try {
+        thisPeer = new Peer(makePeerOptions());
+      } catch (error) {
+        console.error('Could not create PeerJS client:', error);
+        showToast('Không khởi tạo được PeerJS. Hãy tải lại trang và kiểm tra kết nối mạng.', 'error');
+        leaveRoom(true);
+        return;
+      }
+      peer = thisPeer;
+      attachPeerSignalingRecovery(thisPeer, 'thành viên');
+      let roomConnectionStarted = false;
+      clientPeerOpenTimer = window.setTimeout(() => {
+        if (peer === thisPeer && !roomConnectionStarted && !leaving) {
+          console.error('PeerJS client did not emit open within the timeout.');
+          showToast('PeerJS không kết nối được máy chủ tín hiệu trong 15 giây. Kiểm tra mạng/VPN/tường lửa rồi thử lại.', 'error');
+          leaveRoom(true);
+        }
+      }, PEER_OPEN_TIMEOUT_MS);
+
+      thisPeer.on('open', (id) => {
+        if (leaving || peer !== thisPeer || roomConnectionStarted) return;
+        roomConnectionStarted = true;
+        clearTimeout(clientPeerOpenTimer);
+        clientPeerOpenTimer = null;
         myPeerId = id;
-        peer.on('call', handleIncomingPeerCall);
-        const conn = peer.connect(hostId, {
+        thisPeer.on('call', handleIncomingPeerCall);
+        connectClientToHost(thisPeer);
+      });
+
+      thisPeer.on('error', (err) => {
+        console.warn('Peer client error:', err);
+        const type = err && err.type ? err.type : 'unknown';
+        if (!leaving && ['network', 'server-error', 'socket-error', 'socket-closed', 'ssl-unavailable', 'invalid-key', 'invalid-id', 'browser-incompatible'].includes(type)) {
+          setConnectionStatus('Lỗi kết nối PeerJS', 'offline');
+          showToast(peerErrorText(err), 'error');
+          if (thisPeer.destroyed) window.setTimeout(() => { if (!leaving && peer === thisPeer) leaveRoom(true); }, 300);
+        }
+      });
+    }
+
+    function scheduleHostDataReconnect(peerInstance) {
+      if (leaving || peer !== peerInstance || peerInstance.destroyed || hostDataReconnectTimer) return;
+      if (hostDataReconnectAttempts >= 6) {
+        showToast('Không thể khôi phục kết nối dữ liệu tới phòng sau nhiều lần thử. Hãy kiểm tra chủ phòng/mạng rồi vào lại.', 'error');
+        leaveRoom(true);
+        return;
+      }
+      const attempt = hostDataReconnectAttempts++;
+      const delay = Math.min(8000, 1000 * (2 ** Math.min(attempt, 3)));
+      hostDataReconnectTimer = window.setTimeout(() => {
+        hostDataReconnectTimer = null;
+        if (leaving || peer !== peerInstance || peerInstance.destroyed) return;
+        if (peerInstance.disconnected) {
+          scheduleHostDataReconnect(peerInstance);
+          return;
+        }
+        connectClientToHost(peerInstance);
+      }, delay);
+    }
+
+    function stopRemoteCallsForDataReconnect() {
+      Object.entries(mediaCalls).forEach(([id, call]) => {
+        delete mediaCalls[id];
+        clearTimeout(call && call._roomCallTimeout);
+        try { call.close(); } catch (_) {}
+        cleanupAudioMonitor(id);
+        removeAudioElement(id);
+      });
+      stopLatencyMonitor();
+    }
+
+    function handleHostDataConnectionFailure(conn, peerInstance, error) {
+      if (leaving || hostConnection !== conn) return;
+      if (error) console.warn('Room data connection lost; will retry:', error);
+      clearTimeout(conn._roomAuthTimer);
+      hostConnection = null;
+      hostDataConnecting = false;
+      try { conn.close(); } catch (_) {}
+      if (authAccepted) {
+        authAccepted = false;
+        $('message-input').disabled = true;
+        $('send-button').disabled = true;
+        stopLocalTyping();
+        stopRemoteCallsForDataReconnect();
+      }
+      setConnectionStatus('Đang khôi phục kết nối phòng', 'waiting');
+      if (!hostDataReconnectNoticeShown) {
+        hostDataReconnectNoticeShown = true;
+        showToast('Mất kết nối dữ liệu với chủ phòng. Đang tự thử kết nối lại…');
+      }
+      scheduleHostDataReconnect(peerInstance);
+    }
+
+    function connectClientToHost(peerInstance) {
+      if (leaving || peer !== peerInstance || peerInstance.destroyed || hostDataConnecting || hostConnection) return;
+      if (peerInstance.disconnected) {
+        scheduleHostDataReconnect(peerInstance);
+        return;
+      }
+      hostDataConnecting = true;
+      let conn;
+      try {
+        conn = peerInstance.connect(hostId, {
           reliable: true,
           metadata: { username: myUsername, avatar: myAvatar, passHash: roomPasswordHash, peerId: myPeerId, clientKey: currentClientKey }
         });
-        hostConnection = conn;
-        let authResponseReceived = false;
-        const authTimer = window.setTimeout(() => {
-          if (!authResponseReceived && !leaving) {
-            showToast('Không nhận được phản hồi từ phòng. Kiểm tra ID hoặc thử lại.', 'error');
-            leaveRoom(true);
-          }
-        }, 12000);
-        conn.on('open', () => setConnectionStatus('Đang xác thực mật khẩu', 'waiting'));
-        conn.on('data', (data) => {
-          if (data && data.type === 'auth') {
-            authResponseReceived = true;
-            clearTimeout(authTimer);
-            if (!data.ok) {
-              showToast(data.reason || 'Mật khẩu phòng không đúng.', 'error');
-              leaveRoom(true);
-              return;
-            }
-            authAccepted = true;
-            bannedClientKeys = new Set(Array.isArray(data.bannedClientKeys) ? data.bannedClientKeys.filter(key => typeof key === 'string') : []);
-            Object.keys(usersData).forEach((key) => delete usersData[key]);
-            (Array.isArray(data.members) ? data.members : []).forEach((member) => {
-              if (!member || !member.id) return;
-              usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt) || Date.now(), mutedByHost: !!member.mutedByHost, chatBlocked: !!member.chatBlocked, deafenedByHost: !!member.deafenedByHost };
-            });
-            const ownMember = usersData[myPeerId] || {};
-            usersData[myPeerId] = { ...ownMember, id: myPeerId, name: myUsername, avatar: myAvatar, clientKey: currentClientKey, isSpeaking: false, joinedAt: Number(ownMember.joinedAt)||Date.now(), mutedByHost: !!ownMember.mutedByHost, chatBlocked: !!ownMember.chatBlocked, deafenedByHost: !!ownMember.deafenedByHost };
-            renderUserList();
-            setConnectionStatus('Đã kết nối', 'online');
-            $('message-input').disabled = false;
-            $('send-button').disabled = false;
-            monitorAudioActivity(localStream, myPeerId, true);
-            if (Array.isArray(data.history)) data.history.slice(-MAX_HISTORY).forEach((msg) => appendMessage(msg));
-            pinnedMessages = normalizePinnedMessages(data.pinnedMessages, data.pinnedMessage);
-            pinnedMessage = pinnedMessages[pinnedMessages.length - 1] || null;
-            renderPinnedMessage(); renderMessagePinnedState();
-            applyLocalModerationState();
-            startLatencyMonitor();
-            // Người mới chủ động gọi các thành viên đã có; tránh hai bên gọi trùng nhau.
-            Object.values(usersData).forEach((member) => {
-              if (member.id !== myPeerId) connectAudioToMember(member);
-            });
-          } else if (authAccepted) {
-            handleClientRoomMessage(data);
-          }
-        });
-        conn.on('close', () => {
-          clearTimeout(authTimer);
-          if (!leaving && authAccepted) {
-            setConnectionStatus('Mất kết nối chủ phòng', 'offline');
-            showToast('Chủ phòng đã mất kết nối. Bạn sẽ rời phòng; dữ liệu sẽ được dọn khi heartbeat hết hạn.', 'error');
-            leaveRoom(true);
-          }
-        });
-        conn.on('error', (err) => {
-          console.warn('Data connection error:', err);
-          if (!authAccepted && !leaving) {
-            showToast('Không kết nối được tới phòng. Có thể ID chưa tồn tại hoặc chủ phòng đã ngoại tuyến.', 'error');
-            leaveRoom(true);
-          }
-        });
-      });
-      peer.on('error', (err) => {
-        console.warn('Peer client error:', err);
-        if (!leaving && ['network', 'server-error', 'socket-error'].includes(err.type)) {
-          setConnectionStatus('Lỗi kết nối', 'offline');
-          showToast('Có lỗi kết nối PeerJS. Hãy thử vào lại phòng.', 'error');
+      } catch (error) {
+        hostDataConnecting = false;
+        console.warn('Could not open data connection to room host:', error);
+        scheduleHostDataReconnect(peerInstance);
+        return;
+      }
+      if (!conn) {
+        hostDataConnecting = false;
+        scheduleHostDataReconnect(peerInstance);
+        return;
+      }
+      hostConnection = conn;
+      let authResponseReceived = false;
+      conn._roomAuthTimer = window.setTimeout(() => {
+        if (!authResponseReceived && !leaving && hostConnection === conn) {
+          handleHostDataConnectionFailure(conn, peerInstance, new Error('Timed out waiting for room authentication.'));
         }
+      }, 15000);
+
+      conn.on('open', () => {
+        if (hostConnection === conn && !leaving) setConnectionStatus('Đang xác thực mật khẩu', 'waiting');
+      });
+      conn.on('data', (data) => {
+        if (hostConnection !== conn || leaving) return;
+        if (data && data.type === 'auth') {
+          authResponseReceived = true;
+          clearTimeout(conn._roomAuthTimer);
+          if (!data.ok) {
+            hostDataConnecting = false;
+            showToast(data.reason || 'Mật khẩu phòng không đúng.', 'error');
+            leaveRoom(true);
+            return;
+          }
+          hostDataConnecting = false;
+          hostDataReconnectAttempts = 0;
+          hostDataReconnectNoticeShown = false;
+          if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
+          hostDataReconnectTimer = null;
+          authAccepted = true;
+          bannedClientKeys = new Set(Array.isArray(data.bannedClientKeys) ? data.bannedClientKeys.filter(key => typeof key === 'string') : []);
+          Object.keys(usersData).forEach((key) => delete usersData[key]);
+          (Array.isArray(data.members) ? data.members : []).forEach((member) => {
+            if (!member || !member.id) return;
+            usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt) || Date.now(), mutedByHost: !!member.mutedByHost, chatBlocked: !!member.chatBlocked, deafenedByHost: !!member.deafenedByHost };
+          });
+          const ownMember = usersData[myPeerId] || {};
+          usersData[myPeerId] = { ...ownMember, id: myPeerId, name: myUsername, avatar: myAvatar, clientKey: currentClientKey, isSpeaking: false, joinedAt: Number(ownMember.joinedAt)||Date.now(), mutedByHost: !!ownMember.mutedByHost, chatBlocked: !!ownMember.chatBlocked, deafenedByHost: !!ownMember.deafenedByHost };
+          renderUserList();
+          setConnectionStatus('Đã kết nối', 'online');
+          $('message-input').disabled = false;
+          $('send-button').disabled = false;
+          monitorAudioActivity(localStream, myPeerId, true);
+          if (Array.isArray(data.history)) data.history.slice(-MAX_HISTORY).forEach((msg) => appendMessage(msg));
+          pinnedMessages = normalizePinnedMessages(data.pinnedMessages, data.pinnedMessage);
+          pinnedMessage = pinnedMessages[pinnedMessages.length - 1] || null;
+          renderPinnedMessage(); renderMessagePinnedState();
+          applyLocalModerationState();
+          startLatencyMonitor();
+          Object.values(usersData).forEach((member) => {
+            if (member.id !== myPeerId) connectAudioToMember(member);
+          });
+        } else if (authAccepted) {
+          handleClientRoomMessage(data);
+        }
+      });
+      conn.on('close', () => {
+        if (hostConnection !== conn || leaving) return;
+        handleHostDataConnectionFailure(conn, peerInstance);
+      });
+      conn.on('error', (err) => {
+        console.warn('PeerJS data connection error:', err);
+        if (hostConnection === conn && !leaving) handleHostDataConnectionFailure(conn, peerInstance, err);
       });
     }
 
@@ -1655,7 +1857,11 @@
         const avatar = typeof meta.avatar === 'string' && meta.avatar.length < 500000 ? meta.avatar : '';
         authenticated = true;
         conn._roomAuthed = true;
+        const previousConnection = dataConnections[id];
         dataConnections[id] = conn;
+        if (previousConnection && previousConnection !== conn) {
+          try { previousConnection.close(); } catch (_) {}
+        }
         usersData[id] = { id, name, avatar, clientKey, isSpeaking: false, joinedAt: Date.now(), mutedByHost: false, chatBlocked: false, deafenedByHost: false };
         try { conn.send({ type: 'auth', ok: true, members: getMembersPayload(), history: messageHistory.slice(-MAX_HISTORY), pinnedMessages, pinnedMessage, bannedClientKeys: [...bannedClientKeys] }); }
         catch (error) { console.warn('Cannot send auth response:', error); }
@@ -1663,6 +1869,8 @@
         renderUserList();
         playRoomSound('join');
         setConnectionStatus('Bạn là chủ phòng', 'online');
+        // Chủ phòng cũng là một peer thoại; chỉ đầu có ID nhỏ hơn sẽ khởi tạo cuộc gọi.
+        connectAudioToMember(usersData[id]);
       });
       conn.on('data', (data) => {
         if (authenticated && conn._roomAuthed) handleHostData(conn, data);
@@ -1670,6 +1878,8 @@
       conn.on('close', () => {
         if (!authenticated) return;
         const id = conn.peer;
+        // Bỏ qua sự kiện close từ kết nối cũ nếu cùng peer đã kết nối lại.
+        if (dataConnections[id] !== conn) return;
         delete dataConnections[id];
         if (usersData[id]) {
           updateTypingState(id, usersData[id].name, false);
@@ -1737,24 +1947,80 @@
     }
     function stopLatencyMonitor() { if (latencyTimer) clearInterval(latencyTimer); latencyTimer = null; }
 
+    function shouldInitiateAudio(peerId) {
+      return !!myPeerId && !!peerId && String(myPeerId) < String(peerId);
+    }
+
+    function scheduleAudioReconnect(peerId) {
+      if (leaving || !authAccepted || !peerId || peerId === myPeerId || !usersData[peerId]) return;
+      // Chỉ một phía được phép khởi tạo để tránh offer WebRTC đè lên nhau.
+      if (!shouldInitiateAudio(peerId) || audioReconnectTimers[peerId]) return;
+      const attempt = Number(audioReconnectAttempts[peerId] || 0);
+      const delay = Math.min(12000, 1000 * (2 ** Math.min(attempt, 3)));
+      audioReconnectAttempts[peerId] = attempt + 1;
+      audioReconnectTimers[peerId] = window.setTimeout(() => {
+        delete audioReconnectTimers[peerId];
+        if (leaving || !authAccepted || !usersData[peerId]) return;
+        if (!mediaCalls[peerId]) connectAudioToMember(usersData[peerId]);
+      }, delay);
+    }
+
     function connectAudioToMember(member) {
-      if (!member || !member.id || member.id === myPeerId || !peer || !localStream || !authAccepted) return;
-      if (mediaCalls[member.id] && mediaCalls[member.id].open) return;
+      const activePeer = peer || hostPeer;
+      if (!member || !member.id || member.id === myPeerId || !activePeer || activePeer.destroyed || !localStream || !authAccepted) return;
+      if (!shouldInitiateAudio(member.id)) return;
+      if (activePeer.disconnected) { scheduleAudioReconnect(member.id); return; }
+      if (mediaCalls[member.id]) return;
       try {
-        const call = peer.call(member.id, localStream, {
+        const call = activePeer.call(member.id, localStream, {
           metadata: { username: myUsername, avatar: myAvatar, passHash: roomPasswordHash }
         });
-        if (!call) return;
+        if (!call) {
+          scheduleAudioReconnect(member.id);
+          return;
+        }
         setupCallEvents(call, member.id, member.name, member.avatar);
-      } catch (error) { console.warn('Unable to call member:', member.id, error); }
+      } catch (error) {
+        console.warn('Unable to call member:', member.id, error);
+        scheduleAudioReconnect(member.id);
+      }
     }
 
     function setupCallEvents(call, peerId, username, avatar) {
       const existing = mediaCalls[peerId];
-      if (existing && existing !== call) { try { existing.close(); } catch (_) {} }
+      if (existing && existing !== call) {
+        try { existing._roomReplaced = true; existing.close(); } catch (_) {}
+      }
+      call._roomHasStream = false;
+      call._roomCleanupDone = false;
       mediaCalls[peerId] = call;
+
+      const finishCall = () => {
+        if (call._roomCleanupDone) return;
+        call._roomCleanupDone = true;
+        clearTimeout(call._roomCallTimeout);
+        // A late close/error from a replaced call must not tear down the new call's audio.
+        if (mediaCalls[peerId] !== call) return;
+        delete mediaCalls[peerId];
+        cleanupAudioMonitor(peerId);
+        removeAudioElement(peerId);
+        scheduleAudioReconnect(peerId);
+      };
+
+      call._roomCallTimeout = window.setTimeout(() => {
+        if (mediaCalls[peerId] !== call || call._roomHasStream || leaving) return;
+        console.warn('PeerJS media call timed out before receiving remote stream:', peerId);
+        try { call.close(); } catch (_) {}
+        finishCall();
+      }, MEDIA_CALL_TIMEOUT_MS);
+
       call.on('stream', (remoteStream) => {
-        if (leaving) return;
+        if (leaving || mediaCalls[peerId] !== call) return;
+        call._roomHasStream = true;
+        clearTimeout(call._roomCallTimeout);
+        audioReconnectAttempts[peerId] = 0;
+        if (audioReconnectTimers[peerId]) clearTimeout(audioReconnectTimers[peerId]);
+        delete audioReconnectTimers[peerId];
         playAudioStream(remoteStream, peerId);
         const current = usersData[peerId];
         if (current) {
@@ -1766,12 +2032,13 @@
         renderUserList();
         monitorAudioActivity(remoteStream, peerId, false);
       });
-      call.on('close', () => {
-        if (mediaCalls[peerId] === call) delete mediaCalls[peerId];
-        cleanupAudioMonitor(peerId);
-        removeAudioElement(peerId);
+      call.on('close', finishCall);
+      call.on('error', (err) => {
+        console.warn('Media call error:', peerId, err);
+        if (mediaCalls[peerId] !== call) return;
+        try { call.close(); } catch (_) {}
+        finishCall();
       });
-      call.on('error', (err) => console.warn('Media call error:', peerId, err));
     }
 
     function playAudioStream(stream, id) {
@@ -1976,6 +2243,7 @@
         const member = data.member;
         usersData[member.id] = { id: member.id, name: cleanName(member.name, false), avatar: member.avatar || '', clientKey: member.clientKey || '', isSpeaking: !!member.isSpeaking, joinedAt: Number(member.joinedAt)||Date.now(), mutedByHost:!!member.mutedByHost, chatBlocked:!!member.chatBlocked, deafenedByHost:!!member.deafenedByHost };
         renderUserList(); playRoomSound('join');
+        connectAudioToMember(usersData[member.id]);
       } else if (data.type === 'member_left' && data.id) {
         delete usersData[data.id];
         closeCallsForPeer(data.id);
@@ -2657,6 +2925,16 @@
       if (leaving) return;
       leaving = true;
       clearTimeout(hostAttemptTimer);
+      clearTimeout(clientPeerOpenTimer);
+      clientPeerOpenTimer = null;
+      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
+      hostDataReconnectTimer = null;
+      hostDataConnecting = false;
+      hostDataReconnectAttempts = 0;
+      hostDataReconnectNoticeShown = false;
+      Object.values(audioReconnectTimers).forEach(timer => clearTimeout(timer));
+      Object.keys(audioReconnectTimers).forEach(id => delete audioReconnectTimers[id]);
+      Object.keys(audioReconnectAttempts).forEach(id => delete audioReconnectAttempts[id]);
       if (roomHeartbeatTimer) clearInterval(roomHeartbeatTimer);
       roomHeartbeatTimer = null;
       clearTimeout(typingStopTimer);
@@ -2696,6 +2974,11 @@
     }
 
     async function stopMediaAndPeers() {
+      clearTimeout(clientPeerOpenTimer);
+      clientPeerOpenTimer = null;
+      if (hostDataReconnectTimer) clearTimeout(hostDataReconnectTimer);
+      hostDataReconnectTimer = null;
+      hostDataConnecting = false;
       try { if (hostConnection) hostConnection.close(); } catch (_) {}
       hostConnection = null;
       Object.values(mediaCalls).forEach((call) => { try { call.close(); } catch (_) {} });
